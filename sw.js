@@ -7,7 +7,7 @@
 
 const CACHE = 'study-shell';
 const CORE = [
-  './', 'index.html', 'styles.css', 'icons.js', 'app.js', 'manifest.webmanifest',
+  './', 'index.html', 'styles.css', 'icons.js', 'engine.js', 'kit.js', 'app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png', 'data/library.json'
 ];
 

@@ -1,417 +1,65 @@
 'use strict';
 
-/* =====================================================================
-   storage and migration
-   ===================================================================== */
-const KEY = 'study.v1';
-const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-3);
-const RETIRE_AT = 6;                       // a question solved this many times (and answered right last) is mastered
-const SIZES = [10, 20, 30, 50];
-const TYPE_LABEL = { ox: 'OX', mc: '객관식', short: '주관식', word: '단어' };
+/* UI: shell, screens, sheets, router, sync and updates.
+   Logic lives in engine.js (no DOM) and the motion toolkit in kit.js. */
 
-/* older saves used emoji as subject icons; map them to the drawn glyphs once */
-const EMOJI_ICON = {
-  '\u{1F4D0}': 'calc', '\u{1F524}': 'type', '\u{1F4D6}': 'book', '\u{1F52C}': 'flask', '\u{1F30D}': 'globe',
-  '\u{1F4DC}': 'hourglass', '\u{1F4D8}': 'book', '\u{1F4D5}': 'book', '\u{1F4D7}': 'book', '\u{1F4D9}': 'book',
-  '\u{1F9EE}': 'calc', '\u{1F9EA}': 'flask', '\u{1F4BB}': 'code', '\u{1F3B5}': 'music', '\u{1F3A8}': 'palette',
-  '✏': 'pencil', '\u{1F9E0}': 'bulb', '⚽': 'ball'
-};
-
-const freshDb = () => ({ subjects: [], size: 20, hiddenLib: { exams: {} }, sync: { rev: '', at: 0, count: 0 } });
-function migrate(d) {
-  const out = Object.assign(freshDb(), d);
-  if (!out.hiddenLib || !out.hiddenLib.exams) out.hiddenLib = { exams: {} };
-  if (!SIZES.includes(out.size)) out.size = 20;
-  for (const s of out.subjects) {
-    if (!s.icon) s.icon = EMOJI_ICON[String(s.emoji || '').replace(/️/g, '')] || 'book';
-    delete s.emoji;
-    s.exams = Array.isArray(s.exams) ? s.exams : [];
-    for (const e of s.exams) {
-      e.questions = Array.isArray(e.questions) ? e.questions : [];
-      e.attempts = Array.isArray(e.attempts) ? e.attempts : [];
-      for (const q of e.questions) {
-        if (!q.type) q.type = 'ox';
-        if (q.seen === undefined) q.seen = q.last === undefined ? 0 : Math.max(1, (q.miss || 0) + (q.last ? 1 : 0));
-      }
-    }
-  }
-  return out;
-}
-function load() {
-  try {
-    const d = JSON.parse(localStorage.getItem(KEY));
-    if (d && Array.isArray(d.subjects)) return migrate(d);
-  } catch { /* fall through to empty */ }
-  return freshDb();
-}
-let db = load();
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch { toast('저장하지 못했어요. 브라우저 저장소를 확인해 주세요.'); }
-}
-
-/* =====================================================================
-   dom helpers (user text only ever goes in as text nodes)
-   ===================================================================== */
-function h(tag, props, ...kids) {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(props || {})) {
-    if (v == null || v === false) continue;
-    if (k === 'class') el.className = v;
-    else if (k === 'text') el.textContent = v;
-    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
-    else el.setAttribute(k, v === true ? '' : v);
-  }
-  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
-  return el;
-}
-function icon(name, cls) {
-  const s = h('span', { class: 'ico' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true' });
-  s.innerHTML = iconSvg(name);   // static markup from icons.js, never user text
-  return s;
-}
+const $stage = document.getElementById('stage');
 const $nav = document.getElementById('nav');
 const $view = document.getElementById('view');
 const $tb = document.getElementById('tb');
 const $dock = document.getElementById('dock');
-const $sheet = document.getElementById('sheet');
+const $layer = document.getElementById('layer');
 const $toast = document.getElementById('toast');
-const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
-const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-const finePointer = () => matchMedia('(hover: hover) and (pointer: fine)').matches;
+const root = document.documentElement;
+const onSaveFail = () => toast('저장하지 못했어요. 브라우저 저장소를 확인해 주세요.', { icon: 'info' });
 
+/* =====================================================================
+   toast
+   ===================================================================== */
 let toastTimer;
-function toast(msg) {
-  $toast.textContent = msg;
+function hideToast() { $toast.classList.remove('show'); }
+function toast(msg, { icon: ic = null, action = null, ms = 2600 } = {}) {
+  $toast.replaceChildren(
+    ic ? icon(ic) : null,
+    h('span', { class: 't', text: msg }),
+    action ? h('button', { type: 'button', text: action.label, onclick: () => { hideToast(); action.onClick(); } }) : null);
+  $toast.classList.remove('show');
+  void $toast.offsetWidth;                         // replay the entrance when a new message arrives
   $toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => $toast.classList.remove('show'), 2400);
-}
-function fnv(str) {
-  let x = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) { x ^= str.charCodeAt(i); x = Math.imul(x, 0x01000193); }
-  return (x >>> 0).toString(16).padStart(8, '0');
-}
-function ago(t) {
-  const s = Math.round((Date.now() - t) / 1000);
-  if (s < 45) return '방금';
-  if (s < 3600) return Math.round(s / 60) + '분 전';
-  if (s < 86400) return Math.round(s / 3600) + '시간 전';
-  return Math.round(s / 86400) + '일 전';
-}
-function shuffle(a) {
-  const r = a.slice();
-  for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; }
-  return r;
+  toastTimer = setTimeout(hideToast, action ? Math.max(ms, 6000) : ms);
 }
 
 /* =====================================================================
-   model
+   Claude connection: the phone's Claude app makes the questions, this app receives them.
+   data/library.json is written by tools/quiz.mjs from a Claude Code session and pulled in here.
    ===================================================================== */
-/* hue key -> [light end, dark end]. Dark ends keep white glyphs at 3:1 or better. */
-const PALETTE = {
-  215: ['#4C9DFF', '#1F5FD6'], 150: ['#43C77B', '#17884A'], 35: ['#FFA24A', '#E2631B'],
-  340: ['#FF6FA0', '#D7336F'], 270: ['#9C7BFF', '#6A3FD4'], 180: ['#3CCFD0', '#0E8D9B']
-};
-const HUES = [215, 150, 35, 340, 270, 180];
-const pal = hue => PALETTE[hue] || PALETTE[215];
-const palStyle = hue => `--ca:${pal(hue)[0]};--cb:${pal(hue)[1]}`;
-const sicon = s => (SUBJECT_ICONS.includes(s.icon) ? s.icon : 'book');
-const PRESETS = [['국어', 'book', 340], ['영어', 'type', 215], ['수학', 'calc', 270], ['과학', 'flask', 150], ['사회', 'globe', 35], ['역사', 'hourglass', 180]];
+const REPO = (() => {
+  const m = /^([^.]+)\.github\.io$/.exec(location.hostname), seg = location.pathname.split('/')[1];
+  return m && seg ? `${m[1]}/${seg}` : 'DevToolXD/study';
+})();
+const KIND_LABEL = { auto: '자동', vocab: '단어', math: '수학', quiz: '퀴즈' };
+const KIND_ASK = { vocab: '단어 외우기 (뜻 고르기, 단어 고르기, 쓰기)', math: '수학 풀이 (같거나 비슷한 유형)', quiz: '퀴즈 (OX, 객관식, 주관식)' };
+const makeForm = { subject: '', exam: '', kind: null, count: null, refresh: false };
 
-const findSubject = id => db.subjects.find(s => s.id === id);
-function findExam(id) {
-  for (const s of db.subjects) {
-    const e = s.exams.find(x => x.id === id);
-    if (e) return { s, e };
-  }
-  return null;
+function makeMessage(f) {
+  const lines = [f.refresh ? `이 시험의 새 문제 ${f.count}개를 만들어줘. 이미 있는 문제와 겹치지 않게, 같은 범위에서.` : `책 사진으로 문제 ${f.count}개 만들어줘.`];
+  lines.push(`과목: ${f.subject || '(사진 보고 정해줘)'}`);
+  lines.push(`시험·단원: ${f.exam || '(사진 보고 정해줘)'}`);
+  if (f.kind && f.kind !== 'auto') lines.push(`종류: ${KIND_ASK[f.kind]}`);
+  lines.push(f.refresh ? '다 만들면 앱에 들어가게 data/library.json 에 넣고 push 해줘.' : '사진은 이 메시지에 첨부했어요. 다 만들면 앱에 들어가게 data/library.json 에 넣고 push 해줘.');
+  return lines.join('\n');
 }
-const topicOf = q => q.topic || (q.type === 'word' ? '단어' : '일반');
-const seenOf = q => q.seen || 0;
-const activeQs = e => e.questions.filter(q => !q.done);
-const doneCount = e => e.questions.length - activeQs(e).length;
-const unitOf = e => (e.kind === 'vocab' ? '단어' : '문제');
-const wrongCount = e => activeQs(e).filter(q => q.last === false).length;
-const lastScore = e => {
-  const a = e.attempts[e.attempts.length - 1];
-  return a ? Math.round((a.score / a.total) * 100) : null;
-};
-const subjQ = s => s.exams.reduce((n, e) => n + activeQs(e).length, 0);
-function subjAcc(s) {
-  const sc = s.exams.map(lastScore).filter(x => x !== null);
-  return sc.length ? Math.round(sc.reduce((a, b) => a + b, 0) / sc.length) : null;
-}
-function examAcc(e) {
-  let seen = 0, miss = 0;
-  for (const q of e.questions) { seen += seenOf(q); miss += q.miss || 0; }
-  return seen ? Math.round(((seen - miss) / seen) * 100) : null;
-}
-function allWrong() {
-  const out = [];
-  for (const s of db.subjects) for (const e of s.exams) for (const q of e.questions) if (!q.done && q.last === false) out.push({ s, e, q });
-  return out;
-}
-function allAttempts() {
-  const out = [];
-  for (const s of db.subjects) for (const e of s.exams) for (const a of e.attempts) out.push({ s, e, a });
-  return out.sort((x, y) => y.a.at - x.a.at);
-}
-const libCount = () => db.subjects.reduce((n, s) => n + s.exams.reduce((m, e) => m + e.questions.filter(q => q.lib).length, 0), 0);
-
-/* what a question looks like in lists */
-const rowTitle = q => (q.type === 'word' ? q.term : q.q);
-function rowSub(q) {
-  const parts = [];
-  if (q.type === 'word') parts.push(q.meaning);
-  else parts.push(TYPE_LABEL[q.type] || 'OX');
-  parts.push(topicOf(q));
-  if (q.miss) parts.push(`틀림 ${q.miss}`);
-  return parts.join(' · ');
-}
-function answerText(q) {
-  if (q.type === 'ox') return q.a ? 'O' : 'X';
-  if (q.type === 'mc') return q.choices[q.a];
-  if (q.type === 'short') return q.a;
-  return `${q.term} = ${q.meaning}`;
-}
-
-/* deleting something that came from the CLI hides it on this device, so a sync doesn't bring it back */
-const libKey = e => e.libId || e.id;
-function removeExam(s, e) {
-  if (e.lib) db.hiddenLib.exams[libKey(e)] = 1;
-  s.exams = s.exams.filter(x => x !== e);
-  save();
-}
-function removeSubject(s) {
-  s.exams.forEach(e => { if (e.lib) db.hiddenLib.exams[libKey(e)] = 1; });
-  db.subjects = db.subjects.filter(x => x !== s);
-  save();
-}
-
-/* =====================================================================
-   what to ask next: topics the learner misses more often come up more often,
-   fresh questions get a turn, mastered ones drop out
-   ===================================================================== */
-function topicStats(qs) {
-  const t = {};
-  for (const q of qs) {
-    const s = t[topicOf(q)] || (t[topicOf(q)] = { a: 0, w: 0, n: 0, done: 0 });
-    s.a += seenOf(q); s.w += q.miss || 0;
-    if (q.done) s.done++; else s.n++;
-  }
-  return t;
-}
-function weightOf(q, ts) {
-  const t = ts[topicOf(q)] || { a: 0, w: 0 };
-  const et = (t.w + 1) / (t.a + 2.5);                              // topic error rate, smoothed toward ~0.4
-  const seen = seenOf(q), miss = q.miss || 0;
-  const eq = seen ? (miss + 0.5) / (seen + 1.5) : 0.45;            // this question's own error rate
-  let w = (0.2 + 1.8 * et) * (0.5 + eq);
-  if (!seen) w *= 1.25;                                            // fresh questions enter the rotation
-  if (q.last === false) w *= 1.8;                                  // missed last time
-  if (seen >= 4 && q.last === true) w *= 0.6;                      // nearly mastered
-  if (q.at && Date.now() - q.at < 120000) w *= 0.2;                // just seen
-  return w;
-}
-function pickSession(pool, n) {
-  const cache = new Map();
-  const tsOf = e => { if (!cache.has(e)) cache.set(e, topicStats(e.questions)); return cache.get(e); };
-  return pool
-    .map(it => ({ it, k: Math.pow(Math.random(), 1 / Math.max(0.02, weightOf(it.q, tsOf(it.e)))) }))
-    .sort((a, b) => b.k - a.k).slice(0, n).map(x => x.it);
-}
-function recordAnswer(q, ok) {
-  q.seen = seenOf(q) + 1;
-  if (!ok) q.miss = (q.miss || 0) + 1;
-  q.last = ok;
-  q.at = Date.now();
-  if (q.seen >= RETIRE_AT && ok) q.done = true;
-}
-
-/* ---------- answer matching for typed answers ---------- */
-function normAns(s) {
-  return String(s ?? '').normalize('NFKC').toLowerCase().replace(/−/g, '-').replace(/\s+/g, '').replace(/[.,;。]+$/, '');
-}
-function numVal(s) {
-  const t = s.replace(/,/g, '');
-  let m = /^([+-]?\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/.exec(t);
-  if (m) return Number(m[2]) ? Number(m[1]) / Number(m[2]) : null;
-  m = /^([+-]?(?:\d+\.?\d*|\.\d+))%?$/.exec(t);
-  return m ? Number(m[1]) : null;
-}
-function answerForms(s) {
-  const n = normAns(s), set = new Set([n]);
-  const eq = /^[a-z]{1,2}=(.+)$/.exec(n);                         // "x=3" also counts as "3"
-  if (eq) set.add(eq[1]);
-  const u = /^([+-]?[\d.,/]+)(cm|mm|km|m|kg|g|ml|l|개|명|원|도|°|℃|점|번|살|초|분|시간|%)$/.exec(n);   // "12cm" also counts as "12"
-  if (u) set.add(u[1]);
-  return set;
-}
-function sameAnswer(a, b) {
-  for (const x of answerForms(a)) for (const y of answerForms(b)) {
-    if (x === y) return true;
-    const nx = numVal(x), ny = numVal(y);
-    if (nx !== null && ny !== null && Math.abs(nx - ny) <= 1e-9 * Math.max(1, Math.abs(nx))) return true;
-  }
-  return false;
-}
-const matchesAny = (val, answers) => String(val ?? '').trim() !== '' && answers.some(a => sameAnswer(val, a));
-
-/* ---------- a question becomes a drill: what is shown and how it is answered ---------- */
-function blankHint(term) { return [...term].map((c, i) => (i === 0 || /[\s\-']/.test(c) ? c : '_')).join(' '); }
-function cloze(ex, term) {
-  if (!ex) return '';
-  return ex.replace(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'), '____');
-}
-function makeWordDrill(q, e) {
-  const seen = seenOf(q), others = e.questions.filter(x => x.type === 'word' && x !== q);
-  const distractors = field => {
-    const sameKind = others.filter(w => w.pos && w.pos === q.pos);
-    const uniq = [], seenVals = new Set([normAns(q[field])]);
-    for (const w of [...shuffle(sameKind), ...shuffle(others)]) {
-      const k = normAns(w[field]);
-      if (!seenVals.has(k)) { seenVals.add(k); uniq.push(w[field]); }
-    }
-    return uniq.slice(0, 3);
-  };
-  const stage = seen < 2 ? 0 : seen < 4 ? 1 : 2;     // 2 + 2 + 2 = the six solves that retire a word
-  if (stage === 0) {
-    const d = distractors('meaning');
-    if (d.length >= 2) { const choices = shuffle([q.meaning, ...d]); return { kind: 'mc', label: '단어', prompt: q.term, sub: q.pos || '뜻을 골라요', choices, correct: choices.indexOf(q.meaning), big: true }; }
-  } else if (stage === 1) {
-    const d = distractors('term');
-    if (d.length >= 2) { const choices = shuffle([q.term, ...d]); return { kind: 'mc', label: '단어', prompt: q.meaning, sub: '알맞은 단어를 골라요', choices, correct: choices.indexOf(q.term) }; }
-  }
-  return { kind: 'short', label: '단어', prompt: q.meaning, sub: [q.pos, blankHint(q.term)].filter(Boolean).join('  '), extra: cloze(q.ex, q.term), answers: [q.term] };
-}
-function makeDrill(it) {
-  const { q, e } = it;
-  if (q.type === 'ox') return { kind: 'ox', label: 'OX', prompt: q.q, correct: q.a };
-  if (q.type === 'mc') {
-    const order = shuffle(q.choices.map((_, i) => i));
-    return { kind: 'mc', label: '객관식', prompt: q.q, choices: order.map(i => q.choices[i]), correct: order.indexOf(q.a) };
-  }
-  if (q.type === 'short') return { kind: 'short', label: '주관식', prompt: q.q, answers: [q.a, ...(q.alts || [])] };
-  return makeWordDrill(q, e);
-}
-function checkDrill(d, val) {
-  if (d.kind === 'ox' || d.kind === 'mc') return val === d.correct;
-  return matchesAny(val, d.answers);
-}
-const drillAnswer = d => (d.kind === 'ox' ? (d.correct ? 'O' : 'X') : d.kind === 'mc' ? d.choices[d.correct] : d.answers[0]);
-
-/* =====================================================================
-   Claude CLI connection: data/library.json is written by tools/quiz.mjs
-   and pulled in here whenever the app opens or resumes
-   ===================================================================== */
-const ID_RE = /^[A-Za-z0-9_-]{1,48}$/;
-const clip = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
-const normName = v => String(v || '').trim().toLowerCase().replace(/\s+/g, '');
-const KINDS = ['vocab', 'math', 'quiz'];
-const QKEYS = ['type', 'q', 'a', 'choices', 'alts', 'term', 'meaning', 'pos', 'ex', 'topic', 'exp'];
-
-function cleanQuestion(q) {
-  if (!q || !ID_RE.test(q.id)) return null;
-  const type = String(q.type || 'ox');
-  const base = { id: q.id, type, topic: clip(q.topic, 24), exp: clip(q.exp, 300) };
-  if (type === 'word') {
-    const term = clip(q.term, 80), meaning = clip(q.meaning, 160);
-    if (!term || !meaning) return null;
-    const out = { ...base, term, meaning };
-    if (clip(q.pos, 12)) out.pos = clip(q.pos, 12);
-    if (clip(q.ex, 200)) out.ex = clip(q.ex, 200);
-    return out;
-  }
-  const text = clip(q.q, 400);
-  if (!text) return null;
-  if (type === 'ox') return typeof q.a === 'boolean' ? { ...base, q: text, a: q.a } : null;
-  if (type === 'mc') {
-    const ch = Array.isArray(q.choices) ? q.choices.map(c => clip(c, 160)) : [];
-    if (ch.length < 2 || ch.length > 5 || ch.some(c => !c) || new Set(ch).size !== ch.length) return null;
-    if (!Number.isInteger(q.a) || q.a < 0 || q.a >= ch.length) return null;
-    return { ...base, q: text, choices: ch, a: q.a };
-  }
-  if (type === 'short') {
-    const a = clip(q.a, 120);
-    if (!a) return null;
-    const out = { ...base, q: text, a };
-    const alts = (Array.isArray(q.alts) ? q.alts : []).map(x => clip(x, 120)).filter(Boolean).slice(0, 6);
-    if (alts.length) out.alts = alts;
-    return out;
-  }
-  return null;
-}
-
-function cleanLibrary(raw) {
-  const out = [];
-  const subs = raw && Array.isArray(raw.subjects) ? raw.subjects : [];
-  for (const s of subs) {
-    if (!s || !ID_RE.test(s.id) || !clip(s.name, 24)) continue;
-    const exams = [];
-    for (const e of Array.isArray(s.exams) ? s.exams : []) {
-      if (!e || !ID_RE.test(e.id) || !clip(e.name, 40)) continue;
-      const qs = [], seen = new Set();
-      for (const q of Array.isArray(e.questions) ? e.questions : []) {
-        const c = cleanQuestion(q);
-        if (!c || seen.has(c.id)) continue;
-        seen.add(c.id);
-        qs.push(c);
-      }
-      exams.push({ id: e.id, name: clip(e.name, 40), kind: KINDS.includes(e.kind) ? e.kind : 'quiz', questions: qs });
-    }
-    out.push({ id: s.id, name: clip(s.name, 24), icon: SUBJECT_ICONS.includes(s.icon) ? s.icon : 'book', hue: HUES.includes(s.color) ? s.color : 215, exams });
-  }
-  return out;
-}
-
-const sameContent = (a, b) => QKEYS.every(k => JSON.stringify(a[k]) === JSON.stringify(b[k]));
-function applyContent(q, lq) { for (const k of QKEYS) { if (lq[k] === undefined) delete q[k]; else q[k] = lq[k]; } }
-
-function mergeLibrary(lib) {
-  let added = 0, changed = false;
-  const live = new Set();
-  for (const ls of lib) {
-    const visible = ls.exams.filter(e => !db.hiddenLib.exams[e.id]);
-    if (!visible.length) continue;
-    let subj = db.subjects.find(s => s.id === ls.id) || db.subjects.find(s => normName(s.name) === normName(ls.name));
-    if (!subj) {
-      subj = { id: ls.id, name: ls.name, icon: ls.icon, hue: ls.hue, exams: [], lib: true };
-      db.subjects.push(subj);
-      changed = true;
-    }
-    for (const le of visible) {
-      live.add(le.id);
-      /* an exam the learner made by hand with the same name is filled in rather than duplicated */
-      let exam = subj.exams.find(e => e.id === le.id || e.libId === le.id) || subj.exams.find(e => !e.lib && normName(e.name) === normName(le.name));
-      if (!exam) {
-        exam = { id: le.id, name: le.name, kind: le.kind, questions: [], attempts: [], lib: true };
-        subj.exams.push(exam);
-        changed = true;
-      } else {
-        if (!exam.lib) { exam.lib = true; if (exam.id !== le.id) exam.libId = le.id; changed = true; }
-        if (exam.name !== le.name) { exam.name = le.name; changed = true; }
-        if (exam.kind !== le.kind) { exam.kind = le.kind; changed = true; }
-      }
-      const ids = new Set(le.questions.map(q => q.id));
-      for (const lq of le.questions) {
-        const q = exam.questions.find(x => x.id === lq.id);
-        if (!q) { exam.questions.push({ ...lq, lib: true, seen: 0 }); added++; changed = true; }
-        else if (q.lib && !sameContent(q, lq)) { applyContent(q, lq); changed = true; }
-      }
-      const before = exam.questions.length;
-      exam.questions = exam.questions.filter(q => !q.lib || ids.has(q.id));
-      if (exam.questions.length !== before) changed = true;
-    }
-  }
-  /* exams the CLI removed from the library disappear here too */
-  for (const s of db.subjects) {
-    const keep = s.exams.filter(e => !e.lib || live.has(libKey(e)));
-    if (keep.length !== s.exams.length) { s.exams = keep; changed = true; }
-  }
-  const emptyLib = db.subjects.filter(s => s.lib && !s.exams.length);
-  if (emptyLib.length) { db.subjects = db.subjects.filter(s => !emptyLib.includes(s)); changed = true; }
-  return { added, changed };
+const claudeQuery = msg => `repo=${encodeURIComponent(REPO)}&branch=master&q=${encodeURIComponent(msg)}`;
+const claudeUrl = msg => `https://claude.ai/code/new?${claudeQuery(msg)}`;
+const claudeScheme = msg => `claude://code/new?${claudeQuery(msg)}`;
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back below */ }
+  try {
+    const t = h('textarea', { 'aria-hidden': 'true', style: 'position:fixed;left:-9999px;top:0;opacity:0', text });
+    document.body.append(t); t.focus(); t.select();
+    const ok = document.execCommand('copy'); t.remove(); return ok;
+  } catch { return false; }
 }
 
 const sync = { busy: false, ok: null };
@@ -421,33 +69,65 @@ async function syncLibrary(manual) {
   refreshSyncUI();
   try {
     const res = await fetch('data/library.json', { cache: 'no-store' });
-    if (res.status === 404) { sync.ok = true; db.sync.at = Date.now(); save(); if (manual) toast('아직 CLI에서 보낸 문제가 없어요'); return; }
+    if (res.status === 404) { sync.ok = true; db.sync.at = Date.now(); save(); if (manual) toast('아직 Claude가 보낸 문제가 없어요', { icon: 'info' }); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
     let raw;
     try { raw = JSON.parse(text); } catch { throw new Error('library.json 형식 오류'); }
-    const { added, changed } = mergeLibrary(cleanLibrary(raw));
-    db.sync = { rev: fnv(text), at: Date.now(), count: libCount() };
+    const { added, changed, arrived } = mergeLibrary(cleanLibrary(raw));
+    db.sync = { ...db.sync, rev: fnv(text), at: Date.now(), count: libCount() };
+    if (added) db.sync.last = { at: Date.now(), n: added, subject: arrived[0].subject, exam: arrived[0].exam, examId: arrived[0].examId, many: arrived.length };
     save();
     sync.ok = true;
     if (changed) requestRender();
-    if (added) toast(`새 문제 ${added}개가 들어왔어요`);
-    else if (manual) toast('이미 최신이에요');
+    if (added) onArrival(arrived, added);
+    else if (manual) toast('이미 최신이에요', { icon: 'checkcircle' });
   } catch {
     sync.ok = false;
-    if (manual) toast('동기화하지 못했어요. 연결을 확인해 주세요.');
+    if (manual) toast('가져오지 못했어요. 연결을 확인해 주세요.', { icon: 'info' });
   } finally {
     sync.busy = false;
     refreshSyncUI();
   }
 }
+function onArrival(arrived, added) {
+  if (db.wait) stopWaiting(true);
+  const one = arrived.length === 1 ? arrived[0] : null;
+  toast(one ? `${one.subject} · ${one.exam}에 새 문제 ${one.n}개가 들어왔어요` : `새 문제 ${added}개가 들어왔어요`, {
+    icon: 'sparkle', action: one ? { label: '열기', onClick: () => { location.hash = '#/e/' + one.examId; } } : null
+  });
+}
 const syncText = () =>
   sync.ok === false ? '연결할 수 없어요. 다음에 다시 시도해요'
-    : db.sync.at ? `${ago(db.sync.at)} 동기화 · CLI 문제 ${db.sync.count}개` : '아직 동기화하지 않았어요';
+    : db.sync.at ? `${ago(db.sync.at)} 확인 · Claude 문제 ${db.sync.count}개` : '아직 확인하지 않았어요';
 function refreshSyncUI() {
   document.querySelectorAll('.js-sync').forEach(b => b.classList.toggle('spin', sync.busy));
   document.querySelectorAll('.js-sync-text').forEach(t => { t.textContent = syncText(); });
 }
+
+/* after you send the request to Claude, check for the answer more often for a while */
+let waitTimer = null, waitTick = null;
+function startWaiting(info) {
+  db.wait = { since: Date.now(), subject: info.subject || '', exam: info.exam || '' };
+  save();
+  armWait();
+}
+function stopWaiting(arrived) {
+  db.wait = null; save();
+  clearInterval(waitTimer); waitTimer = null;
+  if (arrived && /^#\/make/.test(location.hash)) requestRender();
+}
+function armWait() {
+  clearInterval(waitTimer);
+  waitTimer = null;
+  if (!db.wait) return;
+  waitTimer = setInterval(() => {
+    if (!db.wait) { clearInterval(waitTimer); return; }
+    if (Date.now() - db.wait.since > 30 * 60 * 1000) { stopWaiting(); if (/^#\/make/.test(location.hash)) requestRender(); return; }
+    if (document.visibilityState === 'visible') syncLibrary();
+  }, 12000);
+}
+const mmss = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
 /* =====================================================================
    Home Screen app: service worker + automatic updates
@@ -455,19 +135,19 @@ function refreshSyncUI() {
 let swReg = null, baseFp = null, appVersion = '', pendingReload = false, renderPending = false;
 
 async function fingerprint() {
-  const files = ['index.html', 'styles.css', 'icons.js', 'app.js'];
+  const files = ['index.html', 'styles.css', 'icons.js', 'engine.js', 'kit.js', 'app.js'];
   const texts = await Promise.all(files.map(f => fetch(f, { cache: 'no-store' }).then(r => (r.ok ? r.text() : Promise.reject(new Error(f))))));
   return fnv(texts.join('\u0000'));
 }
-const busyForReload = () => (play && !play.done) || $sheet.open;
+const busyForReload = () => (play && !play.done) || sheets.length > 0 || isTyping();
 async function checkUpdate(manual) {
   try {
     const fp = await fingerprint();
-    if (baseFp === null) { baseFp = fp; appVersion = fp.slice(0, 6); refreshVersionUI(); if (manual) toast('최신 버전이에요'); return; }
-    if (fp === baseFp) { if (manual) toast('최신 버전이에요'); return; }
-    if (busyForReload()) { pendingReload = true; toast('새 버전이 준비됐어요. 끝나면 적용돼요'); return; }
+    if (baseFp === null) { baseFp = fp; appVersion = fp.slice(0, 6); refreshVersionUI(); if (manual) toast('최신 버전이에요', { icon: 'checkcircle' }); return; }
+    if (fp === baseFp) { if (manual) toast('최신 버전이에요', { icon: 'checkcircle' }); return; }
+    if (busyForReload()) { pendingReload = true; toast('새 버전이 준비됐어요. 끝나면 적용돼요', { icon: 'refresh' }); return; }
     reloadForUpdate();
-  } catch { if (manual) toast('업데이트를 확인하지 못했어요'); }
+  } catch { if (manual) toast('업데이트를 확인하지 못했어요', { icon: 'info' }); }
 }
 function reloadForUpdate() {
   try { sessionStorage.setItem('study.updated', '1'); } catch { /* private mode */ }
@@ -483,6 +163,7 @@ function onWake() {
   if (swReg) swReg.update().catch(() => {});
   checkUpdate();
   syncLibrary();
+  armWait();
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') onWake(); });
 window.addEventListener('online', onWake);
@@ -493,11 +174,12 @@ if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
   navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => { swReg = r; }).catch(() => {});
 }
 
-/* work that arrives while a sheet or a quiz is open waits until it's over */
+/* work that arrives while a sheet, a quiz or the keyboard is open waits until it's over */
 function requestRender() {
   if (busyForReload()) { renderPending = true; return; }
   route(true);
 }
+document.addEventListener('focusout', () => setTimeout(() => flushPending(), 80));
 function flushPending() {
   if (busyForReload()) return;
   if (pendingReload) { pendingReload = false; reloadForUpdate(); return; }
@@ -517,40 +199,29 @@ document.addEventListener('dragstart', e => e.preventDefault());
 document.addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
 
 const vv = window.visualViewport;
-let zoomResetAt = 0;
-function resetZoom() {                                    // if iOS zoomed in anyway, snap back to 1x
-  const now = Date.now();
-  if (now - zoomResetAt < 800) return;
-  zoomResetAt = now;
-  const m = document.querySelector('meta[name=viewport]');
-  if (!m) return;
-  const orig = m.getAttribute('content');
-  m.setAttribute('content', 'width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover');
-  setTimeout(() => m.setAttribute('content', orig), 150);
-}
 function syncViewport() {
   if (!vv) return;
-  const root = document.documentElement.style;
-  if (vv.scale > 1.02) {
-    root.setProperty('--kb', '0px');
-    document.body.classList.remove('kb-open');
-    if (!isTyping()) resetZoom();
-    return;
-  }
+  const zoomed = vv.scale > 1.02;
   const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
-  const open = kb > 80;                                   // smaller changes are just the browser bar
-  root.setProperty('--kb', (open ? kb : 0) + 'px');
-  root.setProperty('--vvh', Math.round(vv.height) + 'px');
+  const open = !zoomed && kb > 80;                        // smaller changes are just the browser bar
+  root.style.setProperty('--kb', (open ? kb : 0) + 'px');
+  if (zoomed) root.style.removeProperty('--vvh'); else root.style.setProperty('--vvh', Math.round(vv.height) + 'px');
   document.body.classList.toggle('kb-open', open);
 }
 if (vv) { vv.addEventListener('resize', syncViewport); vv.addEventListener('scroll', syncViewport); }
 window.addEventListener('orientationchange', () => setTimeout(syncViewport, 350));
 
 /* =====================================================================
-   shell: navigation, toolbar, screen
+   shell: hue, navigation, toolbar, dock, screen layers
    ===================================================================== */
+function setHue(hue) {
+  const p = pal(hue);
+  root.style.setProperty('--ca', p[0]); root.style.setProperty('--cb', p[1]);
+  root.style.setProperty('--cx', p[2]); root.style.setProperty('--cc', p[3]);
+}
+
 const TABS = [['home', '과목', 'stack', '#/'], ['wrong', '오답노트', 'bookmark', '#/wrong'], ['history', '기록', 'clock', '#/history'], ['settings', '설정', 'sliders', '#/settings']];
-let fabEl = null, sideEl = null;
+let fabEl = null, sideEl = null, tabbarEl = null, fabLabel = '';
 
 function logoMark() {
   const s = h('span', { class: 'logo', 'aria-hidden': 'true' });
@@ -558,72 +229,161 @@ function logoMark() {
   return s;
 }
 function buildNav() {
-  fabEl = h('button', { class: 'glass fab', type: 'button' });
+  tabbarEl = h('div', { class: 'glass tabbar', role: 'group', 'aria-label': '탭', style: `--n:${TABS.length};--i:0` },
+    h('i', { class: 'tab-thumb', 'aria-hidden': 'true' }),
+    TABS.map(([k, label, ic, href]) => h('a', { class: 'tab', 'data-tab': k, href }, icon(ic), h('span', { class: 'tab-label', text: label }))));
+  fabEl = h('button', { class: 'fab off', type: 'button', 'aria-hidden': 'true', tabindex: '-1' });
   sideEl = h('div', { class: 'side' });
-  $nav.replaceChildren(
-    h('div', { class: 'brand' }, logoMark(), h('span', { text: '공부방' })),
-    h('div', { class: 'glass tabbar', role: 'group', 'aria-label': '탭' },
-      TABS.map(([k, label, ic, href]) => h('a', { class: 'tab', 'data-tab': k, href }, icon(ic), h('span', { class: 'tab-label', text: label })))),
-    fabEl, sideEl);
+  $nav.replaceChildren(h('div', { class: 'brand' }, logoMark(), h('span', { text: '공부방' })), tabbarEl, fabEl, sideEl);
 }
 function updateNav(o) {
   document.body.classList.toggle('detail', !!o.detail);
+  const idx = TABS.findIndex(t => t[0] === o.tab);
+  if (idx >= 0) tabbarEl.style.setProperty('--i', idx);
   for (const a of $nav.querySelectorAll('.tab')) {
     if (a.dataset.tab === o.tab) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   if (o.fab) {
-    fabEl.hidden = false;
+    const changed = fabLabel !== o.fab.label;
+    fabLabel = o.fab.label;
     fabEl.replaceChildren(icon(o.fab.icon), h('span', { class: 'fab-label', text: o.fab.label }));
     fabEl.setAttribute('aria-label', o.fab.label);
+    fabEl.removeAttribute('aria-hidden'); fabEl.removeAttribute('tabindex');
     fabEl.onclick = o.fab.onClick;
-  } else fabEl.hidden = true;
+    if (fabEl.classList.contains('off') || changed) { fabEl.classList.remove('off'); pop(fabEl.firstElementChild, { from: 0.5, delay: 120 }); }
+  } else {
+    fabLabel = '';
+    fabEl.classList.add('off'); fabEl.setAttribute('aria-hidden', 'true'); fabEl.setAttribute('tabindex', '-1'); fabEl.onclick = null;
+  }
   sideEl.replaceChildren(
     h('div', { class: 'side-title', text: '과목' }),
     ...db.subjects.map(s => h('a', { class: 'side-row', href: '#/s/' + s.id, 'aria-current': s.id === o.subjectId ? 'true' : null, style: palStyle(s.hue) },
       av(s.hue, sicon(s)), h('span', { class: 'nm', text: s.name }), h('small', { text: String(subjQ(s)) }))));
 }
 
-function toolbar(o) {
-  const lead = o.back ? h('a', { class: 'glass tb-round', href: o.back, 'aria-label': '뒤로' }, icon('back'))
-    : o.close ? h('a', { class: 'glass tb-round', href: o.close, 'aria-label': '닫기' }, icon('close'))
+function toolbar(o, dir) {
+  const lead = o.back ? h('a', { class: 'glass tb-round lit', href: o.back, 'aria-label': '뒤로' }, icon('back'))
+    : o.close ? h('a', { class: 'glass tb-round lit', href: o.close, 'aria-label': '닫기' }, icon('close'))
     : h('span');
   const trail = o.trail && o.trail.length
     ? h('div', { class: 'glass ' + (o.trail.length > 1 ? 'tb-group' : 'tb-round') },
       o.trail.map(t => h('button', { class: 'tb-btn ' + (t.cls || ''), type: 'button', 'aria-label': t.label, onclick: ev => t.onClick(ev.currentTarget) }, icon(t.icon))))
     : h('span');
-  $tb.replaceChildren(lead, h('div', { class: 'tb-title' }, h('span', { text: o.inline || o.title })), trail);
+  const title = h('div', { class: 'tb-title' }, h('span', { text: o.inline || o.title }));
+  $tb.replaceChildren(lead, title, trail);
+  if (dir !== 'replace') { [lead, trail].forEach(el => { if (el.classList.contains('glass')) pop(el, { from: 0.6, dur: 560, delay: dir === 'init' ? 200 : 60 }); }); }
+}
+function setToolbarTitle(text) {
+  const span = $tb.querySelector('.tb-title span');
+  if (!span || span.textContent === text) return;
+  span.textContent = text;
+  anim(span, [{ opacity: 0, transform: 'translateY(6px) scale(.96)' }, { opacity: 1, transform: 'none' }], { dur: 420 });
 }
 
 let largeTitle = true;
 function onScroll() {
   const y = window.scrollY;
   document.body.classList.toggle('scrolled', y > 2);
-  document.body.classList.toggle('title-in', !largeTitle || y > 36);
+  document.body.style.setProperty('--p', (largeTitle ? clamp((y - 14) / 30, 0, 1) : 1).toFixed(3));
 }
 let ticking = false;
 window.addEventListener('scroll', () => {
-  if (routeKey) scrollMem[routeKey] = window.scrollY;
+  if (routeKey && !transitioning) scrollMem[routeKey] = window.scrollY;
   if (ticking) return;
   ticking = true;
   requestAnimationFrame(() => { ticking = false; onScroll(); });
 }, { passive: true });
 
+/* the bottom action bar: the old buttons drift out as a ghost while the new ones spring in */
+function setDock(nodes) {
+  const old = [...$dock.children];
+  if (old.length && !reduceMotion()) {
+    const ghost = h('div', { class: 'dock dock-ghost', 'aria-hidden': 'true' }, old.map(n => n.cloneNode(true)));
+    ghost.style.bottom = getComputedStyle($dock).bottom;
+    document.body.append(ghost);
+    anim(ghost, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(16px) scale(.96)' }], { dur: 220, easing: 'ease-in', fill: 'forwards' }).finished.then(() => ghost.remove(), () => ghost.remove());
+    setTimeout(() => ghost.remove(), 600);
+  }
+  $dock.replaceChildren(...nodes);
+  document.body.classList.toggle('has-dock', nodes.length > 0);
+  nodes.forEach((n, i) => rise(n, { y: 34, scale: 0.94, delay: 60 + i * 55, dur: 640 }));
+}
+
+/* screens are layers: the new one springs in while the old one slides back as a fixed ghost */
+let navCtx = { dir: 'init', y: 0 };
+let curLayer = null, transitioning = false, transTimer = 0;
+const scrollMem = {};
+let routeKey = '';
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
+function mountScreen(layer, dir, targetY) {
+  const old = curLayer;
+  curLayer = layer;
+  $view.querySelectorAll('.screen.leaving').forEach(n => n.remove());
+  if (!old || dir === 'init' || dir === 'replace' || !old.isConnected) {
+    $view.replaceChildren(layer);
+    return;
+  }
+  const y = window.scrollY;
+  old.classList.add('leaving');
+  old.style.top = -y + 'px';
+  old.setAttribute('aria-hidden', 'true');
+  old.inert = true;
+  $view.append(layer);
+  window.scrollTo(0, targetY);
+  transitioning = true;
+  clearTimeout(transTimer);
+  transTimer = setTimeout(() => { transitioning = false; }, 700);
+
+  /* the old layer is gone by about half way, the new one starts a beat later, so the two never read as overlapping text */
+  const out = (to, dur, easing) => anim(old, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: to, offset: 0.55 }, { opacity: 0, transform: to }], { dur, easing, fill: 'forwards' });
+  let outA, inA;
+  if (dir === 'push') {
+    outA = out('translate3d(-14%, 0, 0) scale(.96)', 440, 'cubic-bezier(.4, 0, .2, 1)');
+    inA = anim(layer, [{ opacity: 0, transform: 'translate3d(32%, 0, 0)' }, { opacity: 1, transform: 'none' }], { dur: 660, easing: 'spring-soft', delay: 70 });
+  } else if (dir === 'pop') {
+    outA = out('translate3d(30%, 0, 0)', 400, 'cubic-bezier(.4, 0, 1, 1)');
+    inA = anim(layer, [{ opacity: 0, transform: 'translate3d(-14%, 0, 0) scale(.96)' }, { opacity: 1, transform: 'none' }], { dur: 660, easing: 'spring-soft', delay: 70 });
+  } else {
+    const s = dir === 'tab-l' ? -1 : dir === 'tab-r' ? 1 : 0;
+    outA = out(`translate3d(${-s * 7}%, 0, 0) scale(.985)`, 320, 'ease-in');
+    inA = anim(layer, [{ opacity: 0, transform: `translate3d(${s * 7}%, ${s ? 0 : 14}px, 0) scale(.985)` }, { opacity: 1, transform: 'none' }], { dur: 620, easing: 'spring-soft', delay: 60 });
+  }
+  const drop = () => old.remove();
+  outA.finished.then(drop, drop);
+  setTimeout(drop, 900);
+  inA.finished.then(() => { transitioning = false; }, () => { transitioning = false; });
+}
+
 /* o: { title, head, body, back, close, trail, dock, inline, hue, tab, detail, fab, subjectId, plain } */
 function screen(o) {
-  const [a, b] = pal(o.hue);
-  document.body.style.setProperty('--ca', a);
-  document.body.style.setProperty('--cb', b);
+  const dir = navCtx.dir;
+  setHue(o.hue);
   largeTitle = !o.plain;
-  toolbar(o);
+  toolbar(o, dir);
   updateNav(o);
-  $view.replaceChildren(...[].concat(o.head || [], o.body || []).filter(Boolean));
-  const dock = (o.dock || []).filter(Boolean);
-  $dock.replaceChildren(...dock);
-  document.body.classList.toggle('has-dock', dock.length > 0);
+  const layer = h('div', { class: 'screen' }, [].concat(o.head || [], o.body || []).filter(Boolean));
+  const prevKeys = dir === 'replace' && curLayer ? new Set([...curLayer.querySelectorAll('[data-key]')].map(n => n.dataset.key)) : null;
+  mountScreen(layer, dir, navCtx.y || 0);
+  setDock((o.dock || []).filter(Boolean));
   document.title = o.title === '공부방' ? '공부방' : `${o.inline || o.title} · 공부방`;
   refreshSyncUI();
   refreshVersionUI();
   onScroll();
+  if (dir === 'init') rise($nav, { y: 70, scale: 0.96, delay: 260, dur: 760 });
+  if (dir === 'init' || dir === 'tab-l' || dir === 'tab-r' || dir === 'swap') enterContent(layer, dir === 'init' ? 70 : 42);
+  if (prevKeys) layer.querySelectorAll('[data-key]').forEach(n => { if (!prevKeys.has(n.dataset.key)) rise(n, { y: 18, dur: 640 }); });
+  navCtx = { dir: 'replace', y: window.scrollY };
+  return layer;
+}
+/* the first things on a screen arrive one after another */
+function enterContent(layer, step) {
+  const targets = [];
+  for (const k of layer.children) {
+    if (k.classList.contains('feed') || k.classList.contains('stack')) targets.push(...k.children);
+    else targets.push(k);
+  }
+  targets.slice(0, 9).forEach((t, i) => rise(t, { y: 22, delay: 60 + i * step, dur: 700 }));
 }
 
 /* =====================================================================
@@ -639,10 +399,11 @@ function qAvatar(q, size) {
 const st = (ic, text) => h('span', { class: 'st' }, icon(ic), text);
 const dim = name => icon(name, 'chev');
 const code = t => h('code', { text: t });
+const chip = (ic, text) => h('span', { class: 'chip' }, ic ? icon(ic) : null, text);
 
 function pageHead({ title, lines, avatar }) {
   return h('header', { class: 'page-head' },
-    h('div', { class: 'ph-text' }, h('h1', { text: title }), ...(lines || []).filter(Boolean).map(l => h('p', { class: 'sub' }, l))),
+    h('div', { class: 'ph-text' }, h('h1', { text: title }), ...(lines || []).filter(Boolean).map(l => h('div', { class: 'sub' }, l))),
     avatar ? h('div', { class: 'ph-av' }, avatar) : null);
 }
 
@@ -662,30 +423,67 @@ function thread(rows) {
   return h('section', { class: 'thread' }, rows);
 }
 function emptyState(ic, title, text, extra) {
-  return h('section', { class: 'empty' }, h('div', { class: 'empty-ico' }, icon(ic)), h('h2', { text: title }), text ? h('p', { text }) : null, extra || null);
+  return h('section', { class: 'empty' }, h('div', { class: 'glass empty-ico' }, icon(ic)), h('h2', { text: title }), text ? h('p', { text }) : null, extra || null);
 }
-function ring(pct, big, label) {
-  const size = big ? 156 : 40, r = big ? 66 : 17, w = big ? 14 : 5, c = 2 * Math.PI * r;
-  const box = h('div', { class: big ? 'ring' : 'mini-ring', role: 'img', 'aria-label': label });
-  box.innerHTML = `<svg viewBox="0 0 ${size} ${size}"><circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--fill2)" stroke-width="${w}"/>` +
-    `<circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="none" stroke="var(--text)" stroke-width="${w}" stroke-linecap="round" stroke-dasharray="${(c * pct) / 100} ${c}"/></svg>`;
-  box.append(h('b', { 'aria-hidden': 'true', text: big ? pct + '%' : String(pct) }));
+function ringEl(pct, { size = 120, w = 12, label = '', sm = false, text = null, count = false } = {}) {
+  const r = (100 - w) / 2, c = 2 * Math.PI * r;
+  const box = h('div', { class: 'ring' + (sm ? ' sm' : ''), role: 'img', 'aria-label': label || `${pct}%`, style: `--rs:${size}px` });
+  box.innerHTML = `<svg viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="${r}" fill="none" stroke-width="${w}"/>` +
+    `<circle class="val" cx="50" cy="50" r="${r}" fill="none" stroke-width="${w}" stroke-linecap="round" style="stroke-dasharray:0 ${c};opacity:${pct ? 1 : 0}"/></svg>`;
+  const val = box.querySelector('.val');
+  const b = h('b', { 'aria-hidden': 'true', text: text != null ? text : sm ? String(pct) : pct + '%' });
+  box.append(b);
+  fillLater(() => { val.style.strokeDasharray = `${(c * pct) / 100} ${c}`; });
+  if (count && !sm) countUp(b, pct, { suffix: '%', dur: 1100 });
   return box;
 }
+function barEl(pct) {
+  const fill = h('span', { style: '--w:0%' });
+  fillLater(() => fill.style.setProperty('--w', Math.max(0, Math.min(100, pct)) + '%'));
+  return h('span', { class: 'bar', 'aria-hidden': 'true' }, fill);
+}
+function statBox(value, label, { count = false, suffix = '' } = {}) {
+  const b = h('b', { text: String(value) + suffix });
+  if (count && typeof value === 'number') countUp(b, value, { suffix, dur: 900 });
+  return h('div', null, b, h('span', { text: label }));
+}
 
-/* popover menu: macOS context menu as glass, anchored to its button */
+/* segmented control with a thumb that slides to the chosen item */
+function seg(items, value, onChange, { cls = '', label, role = 'group', attr = 'aria-pressed', itemRole = null } = {}) {
+  const el = h('div', { class: ['seg', cls], role, 'aria-label': label, style: `--n:${items.length};--i:${Math.max(0, items.findIndex(it => it.value === value))}` });
+  let cur = value;
+  const btns = items.map((it, i) => h('button', { type: 'button', role: itemRole, 'aria-label': it.aria, [attr]: String(it.value === value), onclick: () => pick(i, false) }, it.label));
+  el.append(h('i', { class: 'seg-thumb', 'aria-hidden': 'true' }), ...btns);
+  function pick(i, silent) {
+    if (i < 0) return;
+    const changed = items[i].value !== cur;
+    cur = items[i].value;
+    el.style.setProperty('--i', i);
+    btns.forEach((b, k) => b.setAttribute(attr, String(k === i)));
+    if (!silent && onChange && changed) onChange(cur);
+  }
+  return { el, get: () => cur, set: v => pick(items.findIndex(it => it.value === v), true) };
+}
+
+/* popover menu: a glass sheet that grows out of its button */
 let menuEl = null, scrimEl = null;
-function closeMenu() {
-  if (menuEl) { menuEl.remove(); scrimEl.remove(); menuEl = scrimEl = null; }
+function closeMenu(instant) {
+  if (!menuEl) return;
+  const m = menuEl, s = scrimEl;
+  menuEl = scrimEl = null;
+  s.remove();
+  if (instant || reduceMotion()) { m.remove(); return; }
+  anim(m, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.88)' }], { dur: 170, easing: 'ease-in', fill: 'forwards' }).finished.then(() => m.remove(), () => m.remove());
+  setTimeout(() => m.remove(), 400);
 }
 function openMenu(anchor, items) {
-  closeMenu();
+  closeMenu(true);
   const m = h('div', { class: 'glass menu', role: 'menu' },
     items.map(it => (it === '-' ? h('hr') : h('button', {
       type: 'button', role: 'menuitem', class: 'mitem' + (it.danger ? ' danger' : ''),
       onclick: () => { closeMenu(); it.onClick(); }
     }, icon(it.icon), h('span', { class: 'grow', text: it.label }), it.check ? icon('check') : null))));
-  scrimEl = h('div', { class: 'menu-scrim', onclick: closeMenu });
+  scrimEl = h('div', { class: 'menu-scrim', onclick: () => closeMenu() });
   document.body.append(scrimEl, m);
   menuEl = m;
   const r = anchor.getBoundingClientRect(), w = m.offsetWidth, hh = m.offsetHeight;
@@ -695,34 +493,121 @@ function openMenu(anchor, items) {
   if (flip) top = Math.max(12, r.top - hh - 8);
   m.style.left = left + 'px';
   m.style.top = top + 'px';
-  m.style.transformOrigin = `${r.right - left}px ${flip ? hh : 0}px`;
+  m.style.transformOrigin = `${clamp(r.left + r.width / 2 - left, 0, w)}px ${flip ? hh : 0}px`;
+  anim(m, [{ opacity: 0, transform: 'scale(.62) translateY(-6px)' }, { opacity: 1, transform: 'none' }], { dur: 560, easing: 'spring-bounce' });
+  [...m.querySelectorAll('.mitem')].forEach((b, i) => anim(b, [{ opacity: 0, transform: 'translateY(-6px)' }, { opacity: 1, transform: 'none' }], { dur: 380, delay: 60 + i * 38, easing: 'spring-soft' }));
 }
 
-/* ---------- sheets ---------- */
-function closeSheet() { if ($sheet.open) $sheet.close(); }
-$sheet.addEventListener('click', e => { if (e.target === $sheet) closeSheet(); });
-$sheet.addEventListener('close', () => flushPending());
+/* ---------- sheets: a stack of glass panels with a pull-to-dismiss grabber ---------- */
+const sheets = [];
+const wide = () => matchMedia('(min-width: 640px)').matches;
+const setInert = on => { for (const el of [$stage, $nav, $dock]) el.inert = on; };
 
-function openSheet({ title, body, submit = '저장', danger = false, cancel = '취소', onSubmit }) {
-  closeMenu();
-  const form = h('form', { class: 'sheet-form', method: 'dialog' },
+function openSheet({ title, body, submit = '저장', danger = false, cancel = '취소', onSubmit, onClose }) {
+  closeMenu(true);
+  const opener = document.activeElement;
+  const id = 'sheet-title-' + (sheets.length + 1);
+  const scrim = h('div', { class: 'scrim', onclick: () => closeSheet() });
+  const pull = h('div', { class: 'sheet-pull' },
     h('div', { class: 'grabber', 'aria-hidden': 'true' }),
     h('div', { class: 'sheet-head' },
-      h('button', { type: 'button', class: 'btn sm', onclick: closeSheet, text: cancel }),
-      h('h2', { id: 'sheet-title', text: title }),
-      submit ? h('button', { type: 'submit', class: 'btn sm ' + (danger ? 'danger' : 'prim'), text: submit }) : h('span')),
-    h('div', { class: 'sheet-body' }, body));
+      h('button', { type: 'button', class: 'btn sm lit', onclick: () => closeSheet(), text: cancel }),
+      h('h2', { id, text: title }),
+      submit ? h('button', { type: 'submit', class: 'btn sm lit ' + (danger ? 'danger' : 'prim'), text: submit }) : h('span')));
+  const content = h('div', { class: 'sheet-body' }, body);
+  const form = h('form', { class: 'sheet-form', novalidate: '' }, pull, content);
+  const el = h('div', { class: 'glass sheet', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': id, tabindex: '-1' }, form);
+  const entry = { el, scrim, opener, onClose, closing: false, form };
   form.addEventListener('submit', e => {
     e.preventDefault();
-    if (!onSubmit || onSubmit(form) !== false) closeSheet();
+    if (!onSubmit || onSubmit(form) !== false) closeSheet(entry);
   });
-  $sheet.replaceChildren(form);
-  $sheet.setAttribute('aria-labelledby', 'sheet-title');
-  if (!$sheet.open) $sheet.showModal();
+
+  const below = sheets[sheets.length - 1];
+  if (below) { below.el.classList.add('under'); below.el.inert = true; }
+  sheets.push(entry);
+  setInert(true);
+  $layer.append(scrim, el);
+  el.focus({ preventScroll: true });
+
+  /* enter */
+  anim(scrim, [{ opacity: 0 }, { opacity: 1 }], { dur: 320, easing: 'ease-out' });
+  if (wide()) anim(el, [{ opacity: 0, transform: 'scale(.94) translateY(12px)' }, { opacity: 1, transform: 'none' }], { dur: 560, easing: 'spring' });
+  else anim(el, [{ transform: `translateY(${innerHeight}px)` }, { transform: 'none' }], { dur: 720, easing: 'spring' });
+  [...content.children].forEach((c, i) => rise(c, { y: 18, delay: 130 + i * 48, dur: 640 }));
+  if (!wide()) dragToDismiss(entry, pull);
+
   /* on touch screens an automatic focus pops the keyboard mid-animation, which is what made iOS zoom and shove the sheet */
   const first = form.querySelector('input[type=text], textarea');
-  if (first && finePointer()) first.focus();
+  if (first && finePointer()) first.focus({ preventScroll: true });
+  return entry;
 }
+
+function dragToDismiss(entry, handle) {
+  const el = entry.el;
+  let sy = 0, sx = 0, last = 0, lastT = 0, vy = 0, dy = 0, dt = 1, drag = false, id = null;
+  handle.addEventListener('pointerdown', e => {
+    if (entry.closing || e.button > 0) return;
+    id = e.pointerId; sy = last = e.clientY; sx = e.clientX; lastT = e.timeStamp; vy = 0; dy = 0; drag = false;
+  });
+  handle.addEventListener('pointermove', e => {
+    if (e.pointerId !== id) return;
+    const d = e.clientY - sy;
+    if (!drag) {
+      if (Math.abs(d) < 6 || Math.abs(e.clientX - sx) > Math.abs(d)) return;
+      drag = true;
+      try { handle.setPointerCapture(id); } catch { /* not capturable */ }
+    }
+    dt = Math.max(1, e.timeStamp - lastT);
+    vy = (e.clientY - last) / dt;
+    last = e.clientY; lastT = e.timeStamp;
+    dy = d > 0 ? d : -Math.pow(-d, 0.7);                // pulling up resists
+    el.style.transform = `translateY(${dy}px)`;
+    entry.scrim.style.opacity = String(clamp(1 - Math.max(0, dy) / (innerHeight * 0.7), 0.2, 1));
+  });
+  const end = e => {
+    if (e.pointerId !== id) return;
+    id = null;
+    if (!drag) return;
+    drag = false;
+    /* the drag must not click the button it started on */
+    const swallow = ev => { ev.stopPropagation(); ev.preventDefault(); };
+    document.addEventListener('click', swallow, { capture: true, once: true });
+    setTimeout(() => document.removeEventListener('click', swallow, { capture: true }), 0);
+    if (dy > 110 || vy > 0.7) { closeSheet(entry, { from: dy }); return; }
+    anim(el, [{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { dur: 560, easing: 'spring', fill: 'none' });
+    anim(entry.scrim, [{ opacity: entry.scrim.style.opacity || 1 }, { opacity: 1 }], { dur: 300, fill: 'none' });
+    el.style.transform = ''; entry.scrim.style.opacity = '';
+  };
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
+}
+
+function closeSheet(entry, { instant = false, from = 0 } = {}) {
+  entry = entry || sheets[sheets.length - 1];
+  if (!entry || entry.closing) return Promise.resolve();
+  entry.closing = true;
+  sheets.splice(sheets.indexOf(entry), 1);
+  const below = sheets[sheets.length - 1];
+  if (below) { below.el.classList.remove('under'); below.el.inert = false; } else setInert(false);
+  const finish = () => {
+    entry.el.remove(); entry.scrim.remove();
+    if (!sheets.length && entry.opener && entry.opener.isConnected && finePointer()) entry.opener.focus({ preventScroll: true });
+    if (entry.onClose) entry.onClose();
+    flushPending();
+  };
+  if (instant || reduceMotion()) { finish(); return Promise.resolve(); }
+  entry.el.style.transform = '';
+  anim(entry.scrim, [{ opacity: entry.scrim.style.opacity || 1 }, { opacity: 0 }], { dur: 300, easing: 'ease-out', fill: 'forwards' });
+  const a = wide()
+    ? anim(entry.el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.95) translateY(10px)' }], { dur: 240, easing: 'ease-in', fill: 'forwards' })
+    : anim(entry.el, [{ transform: `translateY(${from}px)` }, { transform: `translateY(${innerHeight}px)` }], { dur: 380, easing: 'cubic-bezier(.4, 0, 1, 1)', fill: 'forwards' });
+  const done = () => finish();
+  a.finished.then(done, done);
+  return a.finished.then(() => {}, () => {});
+}
+function closeAllSheets() { while (sheets.length) closeSheet(sheets[sheets.length - 1], { instant: true }); }
+
 function confirmSheet(title, message, label, onYes) {
   openSheet({ title, body: h('p', { class: 'hint', text: message }), submit: label, danger: true, onSubmit: () => { onYes(); } });
 }
@@ -731,7 +616,7 @@ function picker(items, initial, cls, onChange) {
   let cur = initial;
   const el = h('div', { class: cls, role: 'group' });
   const paint = () => [...el.children].forEach((b, i) => b.setAttribute('aria-pressed', String(items[i].value === cur)));
-  items.forEach(it => el.append(h('button', { type: 'button', 'aria-label': it.aria, style: it.style, onclick: () => { cur = it.value; paint(); if (onChange) onChange(cur); } }, it.label)));
+  items.forEach(it => el.append(h('button', { type: 'button', class: 'lit', 'aria-label': it.aria, style: it.style, onclick: () => { cur = it.value; paint(); if (onChange) onChange(cur); } }, it.label)));
   paint();
   return { el, get: () => cur };
 }
@@ -745,10 +630,10 @@ function subjectSheet(subject) {
   const name = textField('과목 이름', subject && subject.name, '예: 수학', 20);
   let curIcon = subject ? sicon(subject) : SUBJECT_ICONS[0], curHue = subject ? subject.hue : HUES[0];
   const preview = h('div', { class: 'preview' });
-  const paintPreview = () => preview.replaceChildren(av(curHue, curIcon));
-  paintPreview();
-  const iconPick = picker(SUBJECT_ICONS.map(k => ({ value: k, label: icon(k), aria: k })), curIcon, 'picker', v => { curIcon = v; paintPreview(); });
-  const huePick = picker(HUES.map((v, i) => ({ value: v, label: icon('check'), aria: `색상 ${i + 1}`, style: `--s1:${pal(v)[0]};--s2:${pal(v)[1]}` })), curHue, 'swatches', v => { curHue = v; paintPreview(); });
+  const paintPreview = animate => { const a = av(curHue, curIcon); preview.replaceChildren(a); if (animate) pop(a, { from: 0.8 }); };
+  paintPreview(false);
+  const iconPick = picker(SUBJECT_ICONS.map(k => ({ value: k, label: icon(k), aria: k })), curIcon, 'picker', v => { curIcon = v; paintPreview(true); });
+  const huePick = picker(HUES.map((v, i) => ({ value: v, label: icon('check'), aria: `색상 ${i + 1}`, style: `--s1:${pal(v)[0]};--s2:${pal(v)[1]}` })), curHue, 'swatches', v => { curHue = v; paintPreview(true); });
   openSheet({
     title: subject ? '과목 편집' : '새 과목',
     body: [
@@ -759,12 +644,12 @@ function subjectSheet(subject) {
       err,
       subject ? h('div', { class: 'sg' }, h('button', {
         type: 'button', class: 'arow danger',
-        onclick: () => confirmSheet('과목 삭제', `"${subject.name}"과 안의 시험·문제가 모두 지워져요.`, '삭제', () => { removeSubject(subject); location.hash = '#/'; route(true); })
+        onclick: () => confirmSheet('과목 삭제', `"${subject.name}"과 안의 시험·문제가 모두 지워져요.`, '삭제', () => { removeSubject(subject); closeAllSheets(); location.hash = '#/'; route(true); })
       }, icon('trash'), '과목 삭제')) : null
     ],
     onSubmit: () => {
       const n = name.value.trim();
-      if (!n) { err.textContent = '과목 이름을 입력해 주세요.'; name.focus(); return false; }
+      if (!n) { err.textContent = '과목 이름을 입력해 주세요.'; shake(name); name.focus(); return false; }
       if (subject) Object.assign(subject, { name: n, icon: iconPick.get(), hue: huePick.get() });
       else db.subjects.push({ id: uid(), name: n, icon: iconPick.get(), hue: huePick.get(), exams: [] });
       save(); route(true);
@@ -779,16 +664,16 @@ function examSheet(subject, exam) {
     title: exam ? '시험 편집' : '새 시험·단원',
     body: [
       group('이름', name),
-      h('p', { class: 'hint', text: '문제는 직접 쓰지 않아요. 터미널에서 같은 이름으로 사진을 넘기면 채워져요.' }),
+      h('p', { class: 'hint', text: '문제는 직접 쓰지 않아요. 문제 만들기에서 Claude 앱으로 책 사진을 올리면 채워져요.' }),
       err,
       exam ? h('div', { class: 'sg' }, h('button', {
         type: 'button', class: 'arow danger',
-        onclick: () => confirmSheet('시험 삭제', `"${exam.name}"과 문제 ${exam.questions.length}개가 지워져요.`, '삭제', () => { removeExam(subject, exam); location.hash = '#/s/' + subject.id; route(true); })
+        onclick: () => confirmSheet('시험 삭제', `"${exam.name}"과 문제 ${exam.questions.length}개가 지워져요.`, '삭제', () => { removeExam(subject, exam); closeAllSheets(); location.hash = '#/s/' + subject.id; route(true); })
       }, icon('trash'), '시험 삭제')) : null
     ],
     onSubmit: () => {
       const n = name.value.trim();
-      if (!n) { err.textContent = '이름을 입력해 주세요.'; name.focus(); return false; }
+      if (!n) { err.textContent = '이름을 입력해 주세요.'; shake(name); name.focus(); return false; }
       if (exam) exam.name = n;
       else subject.exams.push({ id: uid(), name: n, questions: [], attempts: [] });
       save(); route(true);
@@ -796,28 +681,28 @@ function examSheet(subject, exam) {
   });
 }
 
-/* questions from the CLI are read-only here; only an old hand-written OX question can still be edited */
+/* questions from Claude are read-only here; only an old hand-written OX question can still be edited */
 function questionSheet(exam, q) {
   if (!(q && !q.lib && q.type === 'ox')) return questionView(q);
   const text = h('textarea', { class: 'field', rows: 4, maxlength: 400, 'aria-label': '문장', text: q.q });
-  const ans = picker([{ value: true, label: 'O  맞다', aria: 'O 맞다' }, { value: false, label: 'X  틀리다', aria: 'X 틀리다' }], q.a, 'seg sheet-seg');
+  const ans = seg([{ value: true, label: 'O  맞다', aria: 'O 맞다' }, { value: false, label: 'X  틀리다', aria: 'X 틀리다' }], q.a, null, { cls: 'sheet-seg' });
   const exp = h('textarea', { class: 'field', rows: 2, maxlength: 300, 'aria-label': '해설', placeholder: '해설 (선택)', text: q.exp });
   const err = h('div', { class: 'err', role: 'alert' });
   openSheet({
     title: '문제 편집',
     body: [
       group('문장', text),
-      h('div', null, h('div', { class: 'glabel', text: '정답' }), h('div', { class: 'sg' }, ans.el)),
+      h('div', null, h('div', { class: 'glabel', text: '정답' }), ans.el),
       group('해설', exp),
       err,
       h('div', { class: 'sg' }, h('button', {
         type: 'button', class: 'arow danger',
-        onclick: () => { exam.questions = exam.questions.filter(x => x !== q); save(); closeSheet(); route(true); }
+        onclick: () => { exam.questions = exam.questions.filter(x => x !== q); save(); closeAllSheets(); route(true); }
       }, icon('trash'), '문제 삭제'))
     ],
     onSubmit: () => {
       const t = text.value.trim();
-      if (!t) { err.textContent = '문장을 입력해 주세요.'; text.focus(); return false; }
+      if (!t) { err.textContent = '문장을 입력해 주세요.'; shake(text); text.focus(); return false; }
       Object.assign(q, { q: t, a: ans.get(), exp: exp.value.trim() });
       save(); route(true);
     }
@@ -836,7 +721,7 @@ function questionView(q) {
         q.type === 'word' && q.ex ? h('p', { class: 'muted', text: q.ex }) : null,
         q.exp ? h('p', { text: q.exp }) : null,
         h('div', { class: 'tags' }, h('span', { class: 'tag', text: topicOf(q) }), q.seen ? h('span', { class: 'tag', text: `푼 횟수 ${q.seen}` }) : null, q.miss ? h('span', { class: 'tag', text: `틀림 ${q.miss}` }) : null)),
-      h('p', { class: 'hint', text: q.lib ? 'CLI에서 가져온 문제예요. 고치려면 터미널에서 수정해 주세요.' : '' })
+      q.lib ? h('p', { class: 'hint', text: 'Claude가 만든 문제예요. 고치려면 Claude 앱에서 수정을 요청해 주세요.' }) : null
     ]
   });
 }
@@ -845,14 +730,20 @@ function questionView(q) {
    menus
    ===================================================================== */
 const subjectMenu = s => [
+  { icon: 'sparkle', label: '문제 만들기', onClick: () => { location.hash = '#/make/' + s.id; } },
   { icon: 'plus', label: '시험·단원 추가', onClick: () => examSheet(s) },
   { icon: 'pencil', label: '과목 편집', onClick: () => subjectSheet(s) },
   '-',
-  { icon: 'trash', label: '과목 삭제', danger: true, onClick: () => confirmSheet('과목 삭제', `"${s.name}"과 안의 시험·문제가 모두 지워져요.`, '삭제', () => { removeSubject(s); route(true); }) }
+  { icon: 'trash', label: '과목 삭제', danger: true, onClick: () => confirmSheet('과목 삭제', `"${s.name}"과 안의 시험·문제가 모두 지워져요.`, '삭제', () => {
+    const card = document.querySelector(`.screen:not(.leaving) [data-key="${s.id}"]`);
+    removeSubject(s);
+    if (card) collapse(card).then(() => route(true)); else route(true);
+  }) }
 ];
 const examMenu = (s, e) => [
+  { icon: 'sparkle', label: e.questions.length ? '새 문제 받기' : '문제 만들기', onClick: () => { location.hash = `#/make/${s.id}/${e.id}${e.questions.length ? '/refresh' : ''}`; } },
   { icon: 'pencil', label: '시험 편집', onClick: () => examSheet(s, e) },
-  { icon: 'retry', label: '처음부터 다시', onClick: () => confirmSheet('처음부터 다시', '이 시험의 점수, 오답, 정복 표시를 모두 지우고 처음부터 시작해요. 문제는 그대로 남아요.', '다시 시작', () => { resetExam(e); route(true); toast('처음부터 시작해요'); }) },
+  { icon: 'retry', label: '처음부터 다시', onClick: () => confirmSheet('처음부터 다시', '이 시험의 점수, 오답, 정복 표시를 모두 지우고 처음부터 시작해요. 문제는 그대로 남아요.', '다시 시작', () => { resetExam(e); route(true); toast('처음부터 시작해요', { icon: 'retry' }); }) },
   '-',
   { icon: 'trash', label: '시험 삭제', danger: true, onClick: () => confirmSheet('시험 삭제', `"${e.name}"과 문제 ${e.questions.length}개가 지워져요.`, '삭제', () => { removeExam(s, e); location.hash = '#/s/' + s.id; route(true); }) }
 ];
@@ -872,7 +763,6 @@ function examReply(s, e) {
     meta: [h('span', { text: `${unitOf(e)} ${activeQs(e).length}개` }), done ? h('span', { text: `정복 ${done}` }) : null, sc !== null ? h('span', { text: `최근 ${sc}%` }) : null, wr ? st('xcircle', `오답 ${wr}`) : null]
   });
 }
-
 function subjectThread(s) {
   const acc = subjAcc(s);
   const rows = [post({
@@ -883,25 +773,50 @@ function subjectThread(s) {
   s.exams.slice(0, 2).forEach(e => rows.push(examReply(s, e)));
   if (s.exams.length > 2) rows.push(post({ sm: true, muted: true, avatar: h('span', { class: 'av ghost' }, icon('more')), title: `시험 ${s.exams.length - 2}개 더 보기`, href: '#/s/' + s.id }));
   if (!s.exams.length) rows.push(post({ sm: true, muted: true, avatar: h('span', { class: 'av ghost' }, icon('plus')), title: '첫 시험·단원 만들기', onClick: () => examSheet(s) }));
-  return thread(rows);
+  return h('section', { class: 'card subj lit', style: palStyle(s.hue), 'data-key': s.id }, thread(rows));
+}
+
+/* the most useful next step, as one big card */
+function homeHero() {
+  const total = db.subjects.reduce((n, s) => n + s.exams.reduce((m, e) => m + e.questions.length, 0), 0);
+  if (!total) {
+    return h('section', { class: 'card tinted hero', 'data-key': 'hero' },
+      h('div', { class: 'hero-top' }, h('span', { class: 'av' }, icon('sparkle')), h('div', null, h('span', { class: 'eyebrow', text: '시작하기' }), h('h2', { text: '책 사진으로 문제를 만들어요' }), h('p', { text: 'Claude 앱에서 사진을 올리면 150개가 들어와요' }))),
+      h('a', { class: 'btn prim lit', href: '#/make' }, icon('sparkle'), '문제 만들기'));
+  }
+  let pick = null;
+  for (const x of allAttempts()) if (activeQs(x.e).length) { pick = { s: x.s, e: x.e }; break; }
+  if (!pick) for (const s of db.subjects) { const e = s.exams.find(x => activeQs(x).length); if (e) { pick = { s, e }; break; } }
+  if (!pick) return null;
+  const { s, e } = pick, act = activeQs(e).length, dn = doneCount(e), pct = Math.round((dn / e.questions.length) * 100);
+  return h('section', { class: 'card tinted hero', style: palStyle(s.hue), 'data-key': 'hero' },
+    h('div', { class: 'hero-top' }, av(s.hue, sicon(s)), h('div', null,
+      h('span', { class: 'eyebrow', text: allAttempts().length ? '이어서 공부하기' : '첫 연습을 시작해 봐요' }),
+      h('h2', { text: e.name }), h('p', { text: `${s.name} · 남은 ${unitOf(e)} ${act}개 · 정복 ${pct}%` }))),
+    barEl(pct),
+    h('a', { class: 'btn prim lit', href: `#/p/${e.id}/all` }, icon('play'), `${Math.min(db.size, act)}${unitOf(e) === '단어' ? '개' : '문제'} 연습`));
 }
 
 function viewHome() {
   const subs = db.subjects;
   const body = h('div', { class: 'feed' });
+  const hero = homeHero();
+  if (hero) body.append(hero);
   if (!subs.length) {
-    body.append(emptyState('stack', '첫 과목을 만들어 보세요', '과목을 만들고 시험·단원을 추가한 뒤, 터미널에서 사진을 넘기면 문제가 채워져요.',
+    body.append(emptyState('stack', '첫 과목을 만들어 보세요', '과목을 만들고 시험·단원을 추가한 뒤, Claude 앱에서 사진을 올리면 문제가 채워져요.',
       h('div', { class: 'pills' }, PRESETS.map(([n, ic, hue]) => h('button', {
-        type: 'button', class: 'btn outline',
+        type: 'button', class: 'btn glass lit',
         onclick: () => { db.subjects.push({ id: uid(), name: n, icon: ic, hue, exams: [] }); save(); route(true); }
       }, icon(ic), n)))));
   } else subs.forEach(s => body.append(subjectThread(s)));
   const line = subs.length
-    ? [h('span', { text: `과목 ${subs.length}개` }), h('span', { text: `남은 문제 ${subs.reduce((n, s) => n + subjQ(s), 0)}개` })]
+    ? [chip('stack', `과목 ${subs.length}개`), chip('doc', `남은 문제 ${subs.reduce((n, s) => n + subjQ(s), 0)}개`)]
     : [h('span', { text: '공부할 과목을 만들어 보세요' })];
   screen({
-    title: '과목', hue: 215, tab: 'home', body, head: pageHead({ title: '과목', lines: [line] }),
-    fab: { icon: 'plus', label: '과목 추가', onClick: () => subjectSheet() }
+    title: '과목', hue: 215, tab: 'home', body,
+    head: h('header', { class: 'page-head' }, h('div', { class: 'ph-text' }, h('h1', { text: '과목' }), h('div', { class: 'chips' }, line))),
+    trail: [{ icon: 'plus', label: '과목 추가', onClick: () => subjectSheet() }],
+    fab: { icon: 'sparkle', label: '문제 만들기', onClick: () => { location.hash = '#/make'; } }
   });
 }
 
@@ -911,9 +826,11 @@ function viewWrong() {
   if (!list.length) {
     body.append(emptyState('checkcircle', '오답이 없어요', '문제를 풀다 틀리면 여기에 모여요.'));
   } else {
-    body.append(h('section', { class: 'callout' },
-      h('div', null, h('b', { text: String(list.length) }), h('span', { text: '복습할 오답' })),
-      h('a', { class: 'btn prim', href: '#/p/_/wrong' }, icon('play'), '복습 시작')));
+    const n = h('b', { text: '0' });
+    countUp(n, list.length);
+    body.append(h('section', { class: 'card tinted callout', 'data-key': 'callout' },
+      h('div', null, n, h('span', { text: '복습할 오답' })),
+      h('a', { class: 'btn prim lit', href: '#/p/_/wrong' }, icon('play'), '복습 시작')));
     const feed = h('div', { class: 'feed' });
     for (const s of db.subjects) {
       const mine = list.filter(x => x.s === s);
@@ -923,7 +840,7 @@ function viewWrong() {
         sm: true, clamp: true, avatar: qAvatar(q), title: rowTitle(q), style: palStyle(s.hue), onClick: () => questionSheet(e, q),
         meta: [h('span', { text: e.name }), h('span', { text: topicOf(q) }), q.miss ? h('span', { text: `틀림 ${q.miss}` }) : null]
       })));
-      feed.append(thread(rows));
+      feed.append(h('section', { class: 'card subj', style: palStyle(s.hue), 'data-key': 'w' + s.id }, thread(rows)));
     }
     body.append(feed);
   }
@@ -941,8 +858,8 @@ function dayLabel(t) {
 const timeLabel = t => new Date(t).toLocaleTimeString('ko-KR', { hour: 'numeric', minute: '2-digit' });
 function attemptRow({ s, e, a }) {
   const pct = Math.round((a.score / a.total) * 100);
-  return h('a', { class: 'row', href: '#/e/' + e.id },
-    ring(pct, false, `${pct}%`),
+  return h('a', { class: 'row lit', href: '#/e/' + e.id, style: palStyle(s.hue) },
+    ringEl(pct, { size: 42, w: 14, sm: true, label: `${pct}%` }),
     h('span', { class: 'row-body' },
       h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: e.name }), h('span', { class: 'row-sub', text: `${s.name} · ${a.mode === 'wrong' ? '오답만' : '연습'} · ${timeLabel(a.at)}${a.retired ? ` · 정복 ${a.retired}` : ''}` })),
       h('span', { class: 'score', text: `${a.score}/${a.total}` }), dim('chev')));
@@ -955,17 +872,15 @@ function viewHistory() {
     body.append(emptyState('clock', '아직 기록이 없어요', '연습을 하면 점수가 여기에 쌓여요.'));
   } else {
     const avg = Math.round(all.reduce((n, x) => n + (x.a.score / x.a.total) * 100, 0) / all.length);
-    body.append(h('div', { class: 'facts' },
-      h('div', null, h('b', { text: String(all.length) }), h('span', { text: '연습 횟수' })),
-      h('div', null, h('b', { text: avg + '%' }), h('span', { text: '평균 점수' })),
-      h('div', null, h('b', { text: String(allWrong().length) }), h('span', { text: '남은 오답' }))));
+    body.append(h('section', { class: 'card pad', style: 'padding:14px' }, h('div', { class: 'facts' },
+      statBox(all.length, '연습 횟수', { count: true }), statBox(avg, '평균 점수', { count: true, suffix: '%' }), statBox(allWrong().length, '남은 오답', { count: true }))));
     const days = [];
     for (const x of all) {
       const l = dayLabel(x.a.at);
       if (!days.length || days[days.length - 1].l !== l) days.push({ l, items: [] });
       days[days.length - 1].items.push(x);
     }
-    for (const d of days) body.append(h('div', null, h('div', { class: 'sec', text: d.l }), h('div', { class: 'rows' }, d.items.map(attemptRow))));
+    for (const d of days) body.append(h('div', null, h('div', { class: 'sec', text: d.l }), h('div', { class: 'card rows', style: 'margin-top:0' }, d.items.map(attemptRow))));
   }
   screen({
     title: '기록', hue: 180, tab: 'history', body,
@@ -973,45 +888,48 @@ function viewHistory() {
   });
 }
 
-function srow({ ic, title, sub, subCls, trailing, danger, onClick }) {
+function srow({ ic, title, sub, subCls, trailing, danger, onClick, href }) {
   const inner = [
     h('span', { class: 'tile' }, icon(ic)),
     h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: title }), sub != null ? h('span', { class: 'row-sub ' + (subCls || ''), text: sub }) : null),
     trailing || null
   ];
-  const cls = 'srow' + (danger ? ' danger' : '');
-  return onClick ? h('button', { type: 'button', class: cls, onclick: onClick }, inner) : h('div', { class: cls }, inner);
+  const cls = 'srow lit' + (danger ? ' danger' : '');
+  return href ? h('a', { class: cls, href }, inner) : onClick ? h('button', { type: 'button', class: cls, onclick: onClick }, inner) : h('div', { class: 'srow' + (danger ? ' danger' : '') }, inner);
 }
 
 function viewSettings() {
-  const size = picker(SIZES.map(n => ({ value: n, label: String(n), aria: `${n}문제` })), db.size, 'seg', v => { db.size = v; save(); });
+  const size = seg(SIZES.map(n => ({ value: n, label: String(n), aria: `${n}문제` })), db.size, v => { db.size = v; save(); }, { label: '한 번에 푸는 문제 수' });
   const body = h('div', { class: 'stack' },
-    h('div', null, h('div', { class: 'sec', text: 'Claude CLI 연결' }), h('div', { class: 'group' },
+    h('div', null, h('div', { class: 'sec', text: 'Claude 연결' }), h('div', { class: 'card group' },
+      srow({ ic: 'sparkle', title: '문제 만들기', sub: '책 사진을 Claude 앱에서 올려요', href: '#/make', trailing: dim('chev') }),
       srow({
-        ic: 'terminal', title: '동기화', sub: syncText(), subCls: 'js-sync-text',
-        trailing: h('button', { type: 'button', class: 'btn sm outline js-sync', onclick: () => syncLibrary(true) }, icon('refresh'), '지금')
+        ic: 'refresh', title: '새 문제 확인', sub: syncText(), subCls: 'js-sync-text',
+        trailing: h('button', { type: 'button', class: 'btn sm outline js-sync lit', onclick: () => syncLibrary(true) }, icon('refresh'), '지금')
       }),
-      h('div', { class: 'note' }, '앱을 열 때마다 자동으로 가져와요. 터미널에서 ', code('/quiz'), ' 로 사진을 넘기면 ', code('data/library.json'), ' 에 저장되고 push 돼요. 이 버튼은 바로 확인하고 싶을 때만 써요.'))),
-    h('div', null, h('div', { class: 'sec', text: '연습' }), h('div', { class: 'group' },
-      srow({ ic: 'list', title: '한 번에 푸는 문제', sub: '연습을 시작할 때 고르는 개수예요', trailing: size.el }),
+      h('div', { class: 'note' }, '앱을 열 때마다 자동으로 확인해요. 문제는 폰의 Claude 앱에서 만들어져요. 이 앱은 Claude 계정 정보나 API 키를 받지 않아요.'))),
+    h('div', null, h('div', { class: 'sec', text: '연습' }), h('div', { class: 'card group' },
+      h('div', { class: 'setting' },
+        h('div', { class: 'setting-top' }, h('span', { class: 'tile' }, icon('list')), h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: '한 번에 푸는 문제' }), h('span', { class: 'row-sub', text: '연습을 시작할 때 고르는 개수예요' }))),
+        size.el),
       h('div', { class: 'note' }, '많이 틀린 유형은 더 자주, 잘 맞히는 유형은 덜 나와요. 같은 문제를 ', code(`${RETIRE_AT}번`), ' 풀고 마지막에 맞히면 정복으로 빠져요. 정복한 문제가 늘면 새 문제를 받을 때라고 알려줘요.'))),
-    h('div', null, h('div', { class: 'sec', text: '앱' }), h('div', { class: 'group' },
+    h('div', null, h('div', { class: 'sec', text: '앱' }), h('div', { class: 'card group' },
       srow({ ic: 'share', title: '홈 화면에 추가', sub: standalone() ? '홈 화면 앱으로 실행 중이에요' : 'Safari 공유 버튼, 홈 화면에 추가' }),
       srow({
         ic: 'refresh', title: '업데이트', sub: `버전 ${appVersion || '확인 중'} · 열 때마다 자동 업데이트`, subCls: 'js-version',
-        trailing: h('button', { type: 'button', class: 'btn sm outline', onclick: () => checkUpdate(true) }, '확인')
+        trailing: h('button', { type: 'button', class: 'btn sm outline lit', onclick: () => checkUpdate(true) }, '확인')
       }))),
-    h('div', null, h('div', { class: 'sec', text: '데이터' }), h('div', { class: 'group' },
+    h('div', null, h('div', { class: 'sec', text: '데이터' }), h('div', { class: 'card group' },
       srow({
         ic: 'retry', title: '학습 기록 지우기', sub: '점수, 오답, 정복 표시만 지워요', danger: true,
         onClick: () => confirmSheet('학습 기록 지우기', '푼 기록, 오답, 정복 표시가 모두 지워져요. 문제는 그대로 남아요.', '지우기', () => {
           db.subjects.forEach(s => s.exams.forEach(resetExam));
-          route(true); toast('학습 기록을 지웠어요');
+          route(true); toast('학습 기록을 지웠어요', { icon: 'retry' });
         })
       }),
       srow({
         ic: 'trash', title: '이 기기의 모든 데이터 삭제', sub: '과목, 문제, 기록이 모두 지워져요', danger: true,
-        onClick: () => confirmSheet('모든 데이터 삭제', '이 기기에 저장된 과목, 문제, 기록이 모두 지워져요. CLI로 보낸 문제는 다음 동기화 때 다시 들어와요.', '삭제', () => {
+        onClick: () => confirmSheet('모든 데이터 삭제', '이 기기에 저장된 과목, 문제, 기록이 모두 지워져요. Claude가 보낸 문제는 다음 확인 때 다시 들어와요.', '삭제', () => {
           db = freshDb(); save(); location.hash = '#/'; route(true); syncLibrary();
         })
       }))));
@@ -1022,22 +940,106 @@ function viewSettings() {
 }
 
 /* =====================================================================
+   make: ask the Claude app for questions from book photos
+   ===================================================================== */
+let makeClock = null;
+function viewMake(sid, eid, mode) {
+  const s0 = sid ? findSubject(sid) : null, e0 = s0 && eid ? s0.exams.find(x => x.id === eid) : null;
+  const f = makeForm;
+  if (sid) { f.subject = s0 ? s0.name : f.subject; f.exam = e0 ? e0.name : ''; }
+  f.refresh = mode === 'refresh' && !!e0;
+  if (!f.kind) f.kind = db.make.kind;
+  if (!f.count) f.count = db.make.count;
+  const subjectIn = textField('과목', f.subject, '예: 수학, 영어 단어', 24);
+  const examIn = textField('시험·단원', f.exam, '예: 3단원 함수, Day 12', 30);
+  subjectIn.classList.add('field'); examIn.classList.add('field');
+  const msg = h('div', { class: 'msg', 'aria-live': 'polite' });
+  const go = h('a', { class: 'pbtn lit', target: '_blank', rel: 'noopener' }, icon('sparkle'), 'Claude 앱에서 사진 올리기');
+  const scheme = h('a', { class: 'btn outline lit' }, icon('terminal'), 'claude:// 로 열기');
+  const subjectQuick = h('div', { class: 'quick' }), examQuick = h('div', { class: 'quick' });
+  const kind = seg(Object.entries(KIND_LABEL).map(([value, label]) => ({ value, label })), f.kind, v => { f.kind = v; db.make.kind = v; save(); paint(); }, { label: '문제 종류' });
+  const count = seg(MAKE_COUNTS.map(n => ({ value: n, label: String(n), aria: `${n}개` })), f.count, v => { f.count = v; db.make.count = v; save(); paint(); }, { label: '문제 개수' });
+  function paint() {
+    f.subject = subjectIn.value.trim(); f.exam = examIn.value.trim();
+    const m = makeMessage(f);
+    msg.textContent = m;
+    go.href = claudeUrl(m); scheme.href = claudeScheme(m);
+    subjectQuick.replaceChildren(...db.subjects.map(s => h('button', { type: 'button', 'aria-pressed': String(normName(s.name) === normName(f.subject)), onclick: () => { subjectIn.value = s.name; examIn.value = ''; paint(); } }, s.name)));
+    const cur = db.subjects.find(s => normName(s.name) === normName(f.subject));
+    examQuick.replaceChildren(...(cur ? cur.exams : []).map(e => h('button', { type: 'button', 'aria-pressed': String(normName(e.name) === normName(f.exam)), onclick: () => { examIn.value = e.name; paint(); } }, e.name)));
+    examQuick.hidden = !examQuick.children.length; subjectQuick.hidden = !subjectQuick.children.length;
+  }
+  subjectIn.addEventListener('input', paint); examIn.addEventListener('input', paint);
+  const onGo = () => {
+    paint();
+    copyText(makeMessage(f));
+    startWaiting({ subject: f.subject, exam: f.exam });
+    toast('메시지를 복사했어요. Claude 앱에서 사진을 붙여 보내요', { icon: 'sparkle' });
+    setTimeout(() => { if (/^#\/make/.test(location.hash)) requestRender(); }, 600);
+  };
+  go.addEventListener('click', onGo); scheme.addEventListener('click', onGo);
+  const copyBtn = h('button', { type: 'button', class: 'btn glass lit', onclick: async () => { paint(); toast((await copyText(makeMessage(f))) ? '메시지를 복사했어요' : '복사하지 못했어요', { icon: 'checkcircle' }); } }, icon('doc'), '메시지 복사');
+
+  const wait = db.wait;
+  const waitCard = wait ? h('section', { class: 'card tinted waitcard', 'data-key': 'wait' },
+    h('span', { class: 'pulse-orb' }, icon('sparkle')),
+    h('div', null, h('b', { text: 'Claude가 문제를 만드는 중이에요' }), h('span', null, '보낸 지 ', h('span', { class: 'js-wait-time', text: mmss(Date.now() - wait.since) }), ' · 끝나면 자동으로 들어와요'),
+      h('button', { type: 'button', class: 'linkish', onclick: () => { stopWaiting(); route(true); }, text: '그만 기다리기' }))) : null;
+
+  const last = db.sync.last;
+  const body = h('div', { class: 'stack' },
+    waitCard,
+    h('section', { class: 'card formcard', 'data-key': 'form' },
+      f.refresh ? h('div', { class: 'chips' }, chip('refresh', '새 문제 받기 · 이미 있는 문제와 겹치지 않게')) : null,
+      h('div', { class: 'fl' }, h('label', { text: '과목' }), subjectIn, subjectQuick),
+      h('div', { class: 'fl' }, h('label', { text: '시험·단원' }), examIn, examQuick),
+      h('div', { class: 'fl' }, h('div', { class: 'lab', text: '문제 종류' }), kind.el),
+      h('div', { class: 'fl' }, h('div', { class: 'lab', text: '개수' }), count.el),
+      h('div', { class: 'fl' }, h('div', { class: 'lab', text: 'Claude에게 보낼 메시지' }), msg)),
+    h('div', { class: 'cta' }, go, h('div', { class: 'alt' }, copyBtn, scheme),
+      h('button', { type: 'button', class: 'linkish', onclick: () => { db.wait ? stopWaiting() : null; syncLibrary(true); }, text: '이미 보냈다면 지금 확인하기' })),
+    h('div', null, h('div', { class: 'sec', text: '이렇게 해요' }), h('section', { class: 'card steps' },
+      h('div', { class: 'step' }, h('span', { class: 'num', text: '1' }), h('div', null, h('b', { text: '처음 한 번만. ' }), 'Claude 앱을 설치하고 Claude Pro 계정으로 로그인해요.')),
+      h('div', { class: 'step' }, h('span', { class: 'num', text: '2' }), h('div', null, h('b', { text: '처음 한 번만. ' }), 'Claude 앱의 Code 화면에서 GitHub를 연결하고 저장소 ', code(REPO), ' 를 허용해요.')),
+      h('div', { class: 'step' }, h('span', { class: 'num', text: '3' }), h('div', null, h('b', { text: '만들 때마다. ' }), '위 파란 버튼을 누르면 저장소가 골라진 채로 메시지가 채워져서 Claude 앱이 열려요. + 버튼으로 책 사진을 고르고 보내요.')),
+      h('div', { class: 'step' }, h('span', { class: 'num', text: '4' }), h('div', null, h('b', { text: '끝나면. ' }), '이 앱으로 돌아와요. 새 문제가 알아서 들어와요.')))),
+    h('div', null, h('div', { class: 'sec', text: '도착 현황' }), h('div', { class: 'card group' },
+      srow({ ic: 'sparkle', title: '마지막으로 받은 문제', sub: last ? `${ago(last.at)} · ${last.subject} ${last.exam}${last.many > 1 ? ` 외 ${last.many - 1}개` : ''} · ${last.n}개` : '아직 받은 문제가 없어요' }),
+      srow({
+        ic: 'refresh', title: '새 문제 확인', sub: syncText(), subCls: 'js-sync-text',
+        trailing: h('button', { type: 'button', class: 'btn sm outline js-sync lit', onclick: () => syncLibrary(true) }, icon('refresh'), '지금')
+      }),
+      h('div', { class: 'note' }, '이 앱은 Claude 계정 정보나 API 키를 받지 않아요. 사진은 Claude 앱 안에서만 오가고, 이 앱에는 만들어진 문제만 들어와요.'))));
+  paint();
+  screen({
+    title: '문제 만들기', hue: db.subjects.find(s => s.id === sid) ? db.subjects.find(s => s.id === sid).hue : 215, tab: 'home', detail: true, back: e0 ? '#/e/' + e0.id : s0 ? '#/s/' + s0.id : '#/', body,
+    head: pageHead({ title: f.refresh ? '새 문제 받기' : '문제 만들기', lines: [[h('span', { text: '책 사진은 Claude 앱에서 올려요. 만들어진 문제는 여기로 자동으로 들어와요.' })]] })
+  });
+  clearInterval(makeClock);
+  makeClock = setInterval(() => {
+    const t = document.querySelector('.js-wait-time');
+    if (!t || !db.wait) return;
+    t.textContent = mmss(Date.now() - db.wait.since);
+  }, 1000);
+}
+
+/* =====================================================================
    subject / exam
    ===================================================================== */
 function viewSubject(s) {
   const acc = subjAcc(s);
   const body = h('div', null);
   if (!s.exams.length) {
-    body.append(emptyState('doc', '시험·단원을 만들어요', '예: 중간고사, 3단원, Day 12. 같은 이름으로 터미널에서 사진을 넘기면 문제가 채워져요.'));
+    body.append(emptyState('doc', '시험·단원을 만들어요', '예: 중간고사, 3단원, Day 12. 만든 뒤 문제 만들기에서 Claude 앱으로 사진을 올리면 채워져요.'));
   } else {
-    body.append(h('div', { class: 'rows', style: palStyle(s.hue) }, s.exams.map(e => {
+    body.append(h('div', { class: 'card rows', style: palStyle(s.hue) }, s.exams.map(e => {
       const sc = lastScore(e), wr = wrongCount(e), act = activeQs(e).length, dn = doneCount(e);
-      const sub = !e.questions.length ? '사진으로 채워요' : `${unitOf(e)} ${act}개${dn ? ` · 정복 ${dn}` : ''}${sc !== null ? ` · 최근 ${sc}%` : ''}`;
-      return h('a', { class: 'row', href: '#/e/' + e.id },
+      const sub = !e.questions.length ? 'Claude 앱에서 사진으로 채워요' : `${unitOf(e)} ${act}개${dn ? ` · 정복 ${dn}` : ''}${sc !== null ? ` · 최근 ${sc}%` : ''}`;
+      return h('a', { class: 'row lit', href: '#/e/' + e.id, 'data-key': e.id },
         av(s.hue, 'doc', 'soft'),
         h('span', { class: 'row-body' },
           h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: e.name }), h('span', { class: 'row-sub', text: sub })),
-          e.lib ? h('span', { class: 'badge plain' }, icon('terminal'), 'CLI') : null,
+          e.lib ? h('span', { class: 'badge plain' }, icon('sparkle'), 'Claude') : null,
           wr ? h('span', { class: 'badge' }, icon('xcircle'), String(wr)) : null, dim('chev')));
     })));
   }
@@ -1045,11 +1047,10 @@ function viewSubject(s) {
     title: s.name, hue: s.hue, tab: 'home', detail: true, subjectId: s.id, back: '#/', body,
     head: pageHead({
       title: s.name, avatar: av(s.hue, sicon(s)),
-      lines: [[h('span', { text: `시험 ${s.exams.length}개` }), h('span', { text: `남은 문제 ${subjQ(s)}개` }), acc !== null ? st('checkcircle', `정답률 ${acc}%`) : null]]
+      lines: [[chip('doc', `시험 ${s.exams.length}개`), chip('stack', `남은 문제 ${subjQ(s)}개`), acc !== null ? chip('checkcircle', `정답률 ${acc}%`) : null].filter(Boolean)]
     }),
     trail: [{ icon: 'more', label: '과목 메뉴', onClick: btn => openMenu(btn, subjectMenu(s)) }],
-    dock: [h('button', { type: 'button', class: 'pbtn', onclick: () => examSheet(s) }, icon('plus'), '시험·단원 추가')],
-    fab: { icon: 'plus', label: '시험·단원 추가', onClick: () => examSheet(s) }
+    dock: [h('button', { type: 'button', class: 'gbtn glass lit', onclick: () => examSheet(s) }, icon('plus'), '시험·단원'), h('a', { class: 'pbtn lit', href: '#/make/' + s.id }, icon('sparkle'), '문제 만들기')]
   });
 }
 
@@ -1070,7 +1071,7 @@ function topicRows(s, e) {
         h('span', { class: 'row-main' },
           h('span', { class: 'row-title', text: t.k }),
           h('span', { class: 'row-sub', text: `${t.n}개 남음${t.done ? ` · 정복 ${t.done}` : ''}${t.a ? ` · 정답률 ${Math.round((1 - t.err) * 100)}%` : ' · 아직 안 풀었어요'}` }),
-          h('span', { class: 'bar', 'aria-hidden': 'true' }, h('span', { style: `width:${t.n ? Math.max(3, pct) : 0}%` }))),
+          barEl(t.n ? Math.max(3, pct) : 0)),
         weak ? h('span', { class: 'badge' }, '약해요') : null,
         h('span', { class: 'score', 'aria-label': `출제 비중 ${pct}%`, text: t.n ? `${pct}%` : '-' })));
   });
@@ -1079,64 +1080,81 @@ function topicRows(s, e) {
 function viewExam({ s, e }) {
   if (ui.examFor !== e.id) { ui.examFor = e.id; ui.examTab = 'q'; ui.showDone = false; }
   const total = e.questions.length, act = activeQs(e), dn = total - act.length, wr = wrongCount(e), acc = examAcc(e), unit = unitOf(e);
-  const facts = h('div', { class: 'facts' },
-    h('div', null, h('b', { text: String(act.length) }), h('span', { text: `남은 ${unit}` })),
-    h('div', null, h('b', { text: String(dn) }), h('span', { text: '정복' })),
-    h('div', null, h('b', { text: acc === null ? '-' : acc + '%' }), h('span', { text: '정답률' })));
+  const masteredPct = total ? Math.round((dn / total) * 100) : 0;
   const topicsN = Object.keys(topicStats(e.questions)).length;
-  const tabs = [['q', `${unit} ${act.length}`], ['t', `유형 ${topicsN}`], ['h', `기록 ${e.attempts.length}`]];
-  const body = h('div', null);
-  body.append(h('div', { class: 'utabs', role: 'tablist' }, tabs.map(([k, label]) => h('button', {
-    type: 'button', class: 'utab', role: 'tab', 'aria-selected': String(ui.examTab === k),
-    onclick: () => { if (ui.examTab !== k) { ui.examTab = k; route(true); } }
-  }, label))));
+  const hero = h('section', { class: 'card exam-hero', style: palStyle(s.hue), 'data-key': 'hero' },
+    h('div', { class: 'eh-top' },
+      ringEl(masteredPct, { size: 96, w: 13, label: `정복 ${masteredPct}%`, count: true }),
+      h('div', null,
+        h('span', { class: 'big', text: total ? `정복 ${dn} / ${total}` : '문제를 기다리고 있어요' }),
+        h('div', { class: 'chips' }, h('a', { href: '#/s/' + s.id, class: 'chip' }, icon(sicon(s)), s.name), e.lib ? chip('sparkle', 'Claude') : null))),
+    h('div', { class: 'facts' }, statBox(act.length, `남은 ${unit}`, { count: true }), statBox(dn, '정복', { count: true }), statBox(acc === null ? '-' : acc, '정답률', { count: acc !== null, suffix: acc === null ? '' : '%' })));
 
-  const cmd = h('div', { class: 'cmd' }, code(`/quiz ${s.name} ${e.name} 사진경로`));
-  if (ui.examTab === 'q') {
-    if (!total) {
-      body.append(emptyState('doc', `${unit}가 아직 없어요`, '문제는 직접 쓰지 않아요. 책 사진을 터미널의 Claude CLI에 넘기면 150개가 만들어져요.', cmd));
+  const tabOrder = ['q', 't', 'h'];
+  const cmd = () => h('div', { class: 'pills' }, h('a', { class: 'btn prim lit', href: `#/make/${s.id}/${e.id}` }, icon('sparkle'), '문제 만들기'));
+  const pane = () => {
+    const out = h('div', { class: 'tabpane' });
+    if (ui.examTab === 'q') {
+      if (!total) {
+        out.append(emptyState('doc', `${unit}가 아직 없어요`, '문제는 직접 쓰지 않아요. Claude 앱에서 책 사진을 올리면 150개가 만들어져요.', cmd()));
+      } else {
+        const need = total >= 20 && act.length <= Math.max(10, Math.round(total * 0.25));
+        if (!act.length) {
+          out.append(emptyState('checkcircle', '전부 정복했어요', `${total}개를 모두 6번씩 풀었어요. 새 ${unit}를 받거나, 처음부터 다시 풀 수 있어요.`,
+            h('div', { class: 'pills' },
+              h('a', { class: 'btn prim lit', href: `#/make/${s.id}/${e.id}/refresh` }, icon('sparkle'), '새 문제 받기'),
+              h('button', { type: 'button', class: 'btn glass lit', onclick: () => { resetExam(e); route(true); } }, icon('retry'), '처음부터 다시'))));
+        } else if (need) {
+          out.append(h('section', { class: 'card tinted callout col', style: 'margin-bottom:16px', 'data-key': 'need' },
+            h('div', null, h('b', { text: `정복 ${dn}/${total}` }), h('span', { text: `남은 ${unit}가 적어요. 새 ${unit}로 바꿀 때예요.` })),
+            h('a', { class: 'btn prim lit', href: `#/make/${s.id}/${e.id}/refresh` }, icon('sparkle'), '새 문제 받기')));
+        }
+        const long = act.length > 14;
+        if (act.length) out.append(h('div', { class: 'card rows' + (long ? ' lite long' : ''), style: palStyle(s.hue) + ';margin-top:0' }, act.map(q => qRow(e, q))));
+        if (dn) {
+          out.append(h('button', { type: 'button', class: 'btn glass togg lit', onclick: () => { ui.showDone = !ui.showDone; route(true); } }, icon(ui.showDone ? 'close' : 'check'), ui.showDone ? '정복한 것 숨기기' : `정복한 ${unit} ${dn}개 보기`));
+          if (ui.showDone) out.append(h('div', { class: 'card lite rows done long', 'data-key': 'done-rows', style: palStyle(s.hue) }, e.questions.filter(q => q.done).map(q => qRow(e, q))));
+        }
+      }
+    } else if (ui.examTab === 't') {
+      if (!total) out.append(emptyState('chart', '유형이 아직 없어요', '문제가 들어오면 유형별로 모아 보여줘요.', cmd()));
+      else out.append(h('p', { class: 'note flat' }, '많이 틀린 유형이 더 자주 나와요. 오른쪽 숫자는 다음 연습에서 그 유형이 나올 비중이에요.'), h('div', { class: 'card rows' }, topicRows(s, e)));
+    } else if (!e.attempts.length) {
+      out.append(emptyState('clock', '아직 연습한 기록이 없어요', '시작하기를 눌러 풀어 보세요.'));
     } else {
-      const need = total >= 20 && act.length <= Math.max(10, Math.round(total * 0.25));
-      if (!act.length) {
-        body.append(emptyState('checkcircle', `전부 정복했어요`, `${total}개를 모두 6번씩 풀었어요. 새 ${unit}를 받으려면 터미널에서 /quiz 리프레시를 하거나, 처음부터 다시 풀 수 있어요.`,
-          h('div', { class: 'pills' }, h('button', { type: 'button', class: 'btn outline', onclick: () => { resetExam(e); route(true); } }, icon('retry'), '처음부터 다시'))));
-      } else if (need) {
-        body.append(h('section', { class: 'callout col' },
-          h('div', null, h('b', { text: `정복 ${dn}/${total}` }), h('span', { text: `남은 ${unit}가 적어요. 새 ${unit}로 바꿀 때예요.` })),
-          h('p', { class: 'muted' }, '터미널에서 ', code('/quiz'), ' 로 같은 사진의 새 문제를 받아 오면 자동으로 이어져요.')));
-      }
-      if (act.length) body.append(h('div', { class: 'rows', style: palStyle(s.hue) }, act.map(q => qRow(e, q))));
-      if (dn) {
-        body.append(h('button', { type: 'button', class: 'btn outline togg', onclick: () => { ui.showDone = !ui.showDone; route(true); } }, icon(ui.showDone ? 'close' : 'check'), ui.showDone ? '정복한 것 숨기기' : `정복한 ${unit} ${dn}개 보기`));
-        if (ui.showDone) body.append(h('div', { class: 'rows done', style: palStyle(s.hue) }, e.questions.filter(q => q.done).map(q => qRow(e, q))));
-      }
+      out.append(h('div', { class: 'card rows' }, e.attempts.slice().reverse().map(a => attemptRow({ s, e, a }))));
     }
-  } else if (ui.examTab === 't') {
-    if (!total) body.append(emptyState('chart', '유형이 아직 없어요', '문제가 들어오면 유형별로 모아 보여줘요.', cmd));
-    else body.append(h('p', { class: 'note flat' }, '많이 틀린 유형이 더 자주 나와요. 오른쪽 숫자는 다음 연습에서 그 유형이 나올 비중이에요.'), h('div', { class: 'rows' }, topicRows(s, e)));
-  } else if (!e.attempts.length) {
-    body.append(emptyState('clock', '아직 연습한 기록이 없어요', '시작하기를 눌러 풀어 보세요.'));
-  } else {
-    body.append(h('div', { class: 'rows' }, e.attempts.slice().reverse().map(a => attemptRow({ s, e, a }))));
-  }
+    return out;
+  };
+  const host = h('div', { class: 'panehost' }, pane());
+  const tabs = seg([['q', `${unit} ${act.length}`], ['t', `유형 ${topicsN}`], ['h', `기록 ${e.attempts.length}`]].map(([value, label]) => ({ value, label })), ui.examTab, v => {
+    const dirX = tabOrder.indexOf(v) > tabOrder.indexOf(ui.examTab) ? 1 : -1;
+    ui.examTab = v;
+    const old = host.querySelector('.tabpane:not(.leaving)'), neu = pane();
+    if (old) {
+      old.classList.add('leaving'); old.setAttribute('aria-hidden', 'true');
+      const drop = () => old.remove();
+      anim(old, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: `translateX(${-dirX * 28}px)` }], { dur: 260, easing: 'ease-in', fill: 'forwards' }).finished.then(drop, drop);
+      setTimeout(drop, 600);
+    }
+    host.append(neu);
+    anim(neu, [{ opacity: 0, transform: `translateX(${dirX * 36}px)` }, { opacity: 1, transform: 'none' }], { dur: 600, easing: 'spring-soft' });
+  }, { cls: 'glass utabs', role: 'tablist', attr: 'aria-selected', itemRole: 'tab', label: '시험 보기' });
 
   const n = Math.min(db.size, act.length);
   const dock = act.length ? [
-    h('a', wr ? { class: 'glass gbtn', href: `#/p/${e.id}/wrong` } : { class: 'glass gbtn', 'aria-disabled': 'true' }, icon('bookmark'), `오답 ${wr}`),
-    h('a', { class: 'pbtn', href: `#/p/${e.id}/all` }, icon('play'), `${n}${unit === '단어' ? '개' : '문제'} 연습`)
+    h('a', wr ? { class: 'gbtn glass lit', href: `#/p/${e.id}/wrong` } : { class: 'gbtn glass', 'aria-disabled': 'true' }, icon('bookmark'), `오답 ${wr}`),
+    h('a', { class: 'pbtn lit', href: `#/p/${e.id}/all` }, icon('play'), `${n}${unit === '단어' ? '개' : '문제'} 연습`)
   ] : [];
   screen({
     title: e.name, hue: s.hue, tab: 'home', detail: true, subjectId: s.id, back: '#/s/' + s.id, dock,
-    head: [pageHead({
-      title: e.name, avatar: av(s.hue, 'doc'),
-      lines: [[h('a', { href: '#/s/' + s.id, class: 'st' }, icon(sicon(s)), s.name), e.lib ? st('terminal', 'CLI 연동') : null]]
-    }), facts],
-    body,
+    head: pageHead({ title: e.name, lines: [] }),
+    body: h('div', null, hero, tabs.el, host),
     trail: [{ icon: 'more', label: '시험 메뉴', onClick: btn => openMenu(btn, examMenu(s, e)) }]
   });
 }
 function qRow(e, q) {
-  return h('button', { type: 'button', class: 'row' + (q.done ? ' dn' : ''), onclick: () => questionSheet(e, q) },
+  return h('button', { type: 'button', class: 'row lit' + (q.done ? ' dn' : ''), onclick: () => questionSheet(e, q) },
     qAvatar(q, 36),
     h('span', { class: 'row-body' },
       h('span', { class: 'row-main' }, h('span', { class: 'row-title clamp2', text: rowTitle(q) }), h('span', { class: 'row-sub', text: rowSub(q) })),
@@ -1144,9 +1162,9 @@ function qRow(e, q) {
 }
 
 /* =====================================================================
-   play: the question is a post, the answer is a reply under it
+   play: the question is a glass card, the answer unfolds under it
    ===================================================================== */
-let play = null;
+let play = null, pv = null;
 
 function startPlay(eid, mode) {
   let pool, title, back, hue = 215, name = '', ic = 'book';
@@ -1159,7 +1177,7 @@ function startPlay(eid, mode) {
     if (mode === 'wrong') pool = pool.filter(x => x.q.last === false);
     title = f.e.name; back = '#/e/' + eid; hue = f.s.hue; name = f.s.name; ic = sicon(f.s);
   }
-  if (!pool.length) { toast('풀 문제가 없어요'); location.replace(eid === '_' ? '#/wrong' : '#/e/' + eid); return false; }
+  if (!pool.length) { toast('풀 문제가 없어요', { icon: 'info' }); location.replace(eid === '_' ? '#/wrong' : '#/e/' + eid); return false; }
   const items = pickSession(pool, db.size || 20);
   play = { eid, mode, items, drills: items.map(makeDrill), i: 0, res: [], answered: false, picked: null, ok: null, done: false, retired: 0, title, back, hue, name, ic };
   return true;
@@ -1170,6 +1188,111 @@ function restart(mode) {
   const t = `#/p/${eid}/${mode}`;
   if (location.hash === t) route(); else location.hash = t;
 }
+
+function questionCard(p) {
+  const it = p.items[p.i], d = p.drills[p.i], q = it.q;
+  const where = p.eid === '_' ? `${it.s.name} · ${it.e.name}` : p.name;
+  let choices = null, input = null, wrap = null;
+  if (d.kind === 'mc') {
+    choices = h('div', { class: 'choices', role: 'group', 'aria-label': '보기' }, d.choices.map((c, i) =>
+      h('button', { type: 'button', class: 'choice lit', onclick: () => answer(i) }, h('span', { class: 'cn', text: String(i + 1) }), h('span', { class: 'ct', text: c }))));
+  } else if (d.kind === 'short') {
+    input = h('input', {
+      class: 'ans-input', type: 'text', 'aria-label': '정답 입력', placeholder: '정답을 입력해요',
+      autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done'
+    });
+    wrap = h('div', { class: 'ans-wrap' }, input);
+  }
+  const card = h('section', { class: 'glass qcard', style: palStyle(p.hue) },
+    h('div', { class: 'qhead' }, av(p.hue, p.ic), h('span', { class: 'where', text: where }), h('span', { class: 'tag', text: d.label }), h('span', { class: 'tag soft', text: topicOf(q) })),
+    h('p', { class: 'q-text' + (d.big ? ' term' : ''), text: d.prompt }),
+    d.sub ? h('p', { class: 'q-sub', text: d.sub }) : null,
+    d.extra ? h('p', { class: 'q-sub ex', text: d.extra }) : null,
+    choices || wrap);
+  return { card, choices, input, wrap, d, q };
+}
+
+function feedbackPanel(p, view) {
+  const { d, q } = view, ok = p.ok, lines = [];
+  if (d.kind === 'ox') lines.push(h('div', { class: 'tags' }, h('span', { class: 'tag', text: `내 답 ${p.picked ? 'O' : 'X'}` }), h('span', { class: 'tag', text: `정답 ${d.correct ? 'O' : 'X'}` })));
+  else if (!ok) lines.push(h('p', { class: 'ansline' }, h('b', { text: '정답' }), h('span', { text: drillAnswer(d) })));
+  if (d.kind === 'short' && !ok) lines.unshift(h('p', { class: 'ansline' }, h('b', { text: '내 답' }), h('span', { text: String(p.picked || '(비움)') })));
+  if (q.type === 'word') lines.push(h('p', { class: 'ansline' }, h('b', { text: '뜻' }), h('span', { text: `${q.term} = ${q.meaning}` })));
+  if (q.type === 'word' && q.ex) lines.push(h('p', { class: 'muted' }, q.ex));
+  if (q.exp) lines.push(h('p', { text: q.exp }));
+  const wasRetired = q.done && seenOf(q) >= RETIRE_AT;
+  return h('div', { class: 'glass feedback ' + (ok ? 'ok' : 'no'), 'aria-live': 'polite' },
+    h('div', { class: 'fb-head' }, h('span', { class: 'av ' + (ok ? 'good' : 'bad') }, icon(ok ? 'check' : 'close', 'draw')), h('b', { text: ok ? (wasRetired ? '정답이에요 · 정복!' : '정답이에요') : '오답이에요' })),
+    ...lines,
+    !ok && d.kind === 'short' ? h('button', { type: 'button', class: 'btn sm outline fix lit', onclick: markCorrect }, icon('check'), '맞게 처리') : null);
+}
+
+function dockFor(p, view) {
+  const total = p.items.length, d = view.d;
+  if (p.answered) return [h('button', { id: 'next', type: 'button', class: 'pbtn lit', onclick: next }, p.i + 1 >= total ? '결과 보기' : '다음', icon('chev'))];
+  if (d.kind === 'ox') return [oxBtn(true), oxBtn(false)];
+  if (d.kind === 'short') {
+    const input = view.input;
+    const go = h('button', { type: 'button', class: 'pbtn lit', 'aria-disabled': 'true', onclick: () => submit() }, '확인');
+    const submit = () => { const v = input.value.trim(); if (v) answer(v); };
+    input.addEventListener('input', () => go.setAttribute('aria-disabled', String(!input.value.trim())));
+    input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); submit(); } });
+    return [h('button', { type: 'button', class: 'gbtn glass narrow lit', onclick: () => answer('') }, '모르겠어요'), go];
+  }
+  return [];
+}
+const oxBtn = val => h('button', { type: 'button', class: 'glass oxbtn lit', 'data-v': String(val), 'aria-label': val ? 'O 맞다' : 'X 틀리다', onclick: () => answer(val) },
+  h('span', { class: 'g', 'aria-hidden': 'true', text: val ? 'O' : 'X' }), h('span', { 'aria-hidden': 'true', text: val ? '맞다' : '틀리다' }));
+
+/* build the play screen from the current state (also used when the route is re-entered) */
+function mountPlay() {
+  const p = play;
+  if (p.done) return mountResult();
+  const view = questionCard(p);
+  const total = p.items.length;
+  const progress = h('div', { class: 'progress', role: 'progressbar', 'aria-label': '진행도', 'aria-valuemin': 0, 'aria-valuemax': total, 'aria-valuenow': p.i + (p.answered ? 1 : 0) }, h('span', { style: `--w:${((p.i + (p.answered ? 1 : 0)) / total) * 100}%` }));
+  const wrap = h('div', { class: 'qwrap' }, view.card);
+  pv = { view, wrap, progress };
+  if (p.answered) showAnswered(false);
+  screen({ title: p.title, inline: `${p.i + 1} / ${total}`, close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body: h('div', null, progress, wrap), dock: dockFor(p, view) });
+  if (p.answered) requestAnimationFrame(() => { const n = document.getElementById('next'); if (n) n.focus({ preventScroll: true }); });
+  else if (view.input) view.input.focus({ preventScroll: true });   // synchronous, so it is still inside the tap that opened it
+  if (!p.answered) enterChoices(view);
+}
+function enterChoices(view) {
+  if (view.choices) [...view.choices.children].forEach((c, i) => rise(c, { y: 14, delay: 260 + i * 60, dur: 640 }));
+  if (view.wrap) rise(view.wrap, { y: 14, delay: 280, dur: 640 });
+}
+function setProgress(p) {
+  const done = p.i + (p.answered ? 1 : 0);
+  pv.progress.setAttribute('aria-valuenow', String(done));
+  pv.progress.firstElementChild.style.setProperty('--w', (done / p.items.length) * 100 + '%');
+}
+
+/* the answer arrives in place: choices tint, the card reacts, the explanation unfolds, the dock swaps */
+function showAnswered(animate) {
+  const p = play, { view } = pv, d = view.d, ok = p.ok;
+  if (view.choices) [...view.choices.children].forEach((b, i) => {
+    const cls = i === d.correct ? 'ok' : i === p.picked ? 'no' : 'off';
+    b.classList.add(cls); b.setAttribute('aria-disabled', 'true');
+    if (i === d.correct || i === p.picked) b.append(icon(i === d.correct ? 'check' : 'close', animate ? 'draw' : ''));
+  });
+  if (view.input) { view.input.disabled = true; view.input.value = String(p.picked || ''); view.wrap.classList.add(ok ? 'ok' : 'no'); }
+  const fb = feedbackPanel(p, view);
+  pv.fb = fb;
+  pv.wrap.append(fb);
+  if (!animate) return;
+  reveal(fb);
+  if (ok) {
+    const mine = view.choices ? view.choices.children[p.picked] : view.wrap || view.card;
+    if (mine) pulse(mine, 1.03);
+    if (view.q.done && seenOf(view.q) >= RETIRE_AT) burst(view.card, { n: 22, y: 0.2 });
+  } else shake(view.choices ? view.choices.children[p.picked] || view.card : view.wrap || view.card);
+  setProgress(p);
+  setDock(dockFor(p, view));
+  requestAnimationFrame(() => { const n = document.getElementById('next'); if (n) n.focus({ preventScroll: true }); });
+}
+
 function answer(val) {
   if (!play || play.answered || play.done) return;
   const it = play.items[play.i], d = play.drills[play.i];
@@ -1179,7 +1302,7 @@ function answer(val) {
   if (!was && it.q.done) play.retired++;
   play.res.push({ it, d, ok, val });
   save();
-  renderPlay();
+  showAnswered(true);
 }
 /* a typed answer that was right but written differently: let the learner say so */
 function markCorrect() {
@@ -1190,9 +1313,16 @@ function markCorrect() {
   if (seenOf(q) >= RETIRE_AT && !q.done) { q.done = true; play.retired++; }
   r.ok = true; play.ok = true;
   save();
-  renderPlay();
+  const { view } = pv, old = pv.fb;
+  view.wrap.classList.remove('no'); view.wrap.classList.add('ok');
+  const fb = feedbackPanel(play, view);
+  old.replaceWith(fb); pv.fb = fb;
+  pop(fb.querySelector('.av'), { from: 0.4 });
+  pulse(view.wrap, 1.03);
+  if (q.done && seenOf(q) >= RETIRE_AT) burst(view.card, { n: 22, y: 0.2 });
 }
 function next() {
+  if (!play || !play.answered) return;
   if (play.i + 1 >= play.items.length) {
     if (play.eid !== '_') {
       const f = findExam(play.eid);
@@ -1201,97 +1331,42 @@ function next() {
       save();
     }
     play.done = true;
-  } else {
-    play.i++;
-    play.answered = false; play.picked = null; play.ok = null;
+    navCtx = { dir: 'swap', y: 0 };
+    mountResult();
+    return;
   }
-  renderPlay();
-  window.scrollTo(0, 0);
+  play.i++;
+  play.answered = false; play.picked = null; play.ok = null;
+  const p = play, old = pv, view = questionCard(p);
+  /* the old card and its answer slide off together as one ghost */
+  const ghost = h('div', { class: 'qghost' }, old.view.card, old.fb || null);
+  ghost.style.cssText = 'position:absolute;top:0;left:0;right:0;pointer-events:none';
+  old.wrap.append(ghost);
+  old.wrap.append(view.card);
+  pv = { view, wrap: old.wrap, progress: old.progress };
+  const drop = () => ghost.remove();
+  anim(ghost, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translate3d(-46px, 0, 0) scale(.97)', offset: 0.6 }, { opacity: 0, transform: 'translate3d(-60px, 0, 0) scale(.96)' }], { dur: 360, easing: 'cubic-bezier(.4, 0, 1, 1)', fill: 'forwards' }).finished.then(drop, drop);
+  setTimeout(drop, 800);
+  anim(view.card, [{ opacity: 0, transform: 'translate3d(70px, 0, 0) scale(.98)' }, { opacity: 1, transform: 'none' }], { dur: 700, easing: 'spring-soft', delay: 110 });
+  setProgress(p);
+  setToolbarTitle(`${p.i + 1} / ${p.items.length}`);
+  setDock(dockFor(p, view));
+  if (view.input) view.input.focus({ preventScroll: true });   // inside the tap on "다음", so the keyboard stays up
+  enterChoices(view);
+  window.scrollTo({ top: 0, behavior: reduceMotion() ? 'auto' : 'smooth' });
 }
 
-const oxBtn = val => h('button', { type: 'button', class: 'glass oxbtn', 'aria-label': val ? 'O 맞다' : 'X 틀리다', onclick: () => answer(val) },
-  h('span', { class: 'g', 'aria-hidden': 'true', text: val ? 'O' : 'X' }), h('span', { 'aria-hidden': 'true', text: val ? '맞다' : '틀리다' }));
-
-function renderPlay() {
-  const p = play;
-  if (p.done) return renderResult();
-  const it = p.items[p.i], d = p.drills[p.i], q = it.q, total = p.items.length, answered = p.answered, ok = p.ok;
-  const done = p.i + (answered ? 1 : 0);
-  const where = p.eid === '_' ? `${it.s.name} · ${it.e.name}` : p.name;
-
-  /* what the learner interacts with, inside the question post */
-  let control = null, input = null;
-  if (d.kind === 'mc') {
-    control = h('div', { class: 'choices', role: 'group', 'aria-label': '보기' }, d.choices.map((c, i) => {
-      const state = answered ? (i === d.correct ? ' ok' : i === p.picked ? ' no' : ' off') : '';
-      return h('button', { type: 'button', class: 'choice' + state, 'aria-disabled': String(answered), onclick: () => answer(i) },
-        h('span', { class: 'cn', text: String(i + 1) }), h('span', { class: 'ct', text: c }),
-        answered && i === d.correct ? icon('check') : answered && i === p.picked ? icon('close') : null);
-    }));
-  } else if (d.kind === 'short') {
-    input = h('input', {
-      class: 'ans-input', type: 'text', 'aria-label': '정답 입력', placeholder: '정답을 입력해요', value: answered ? String(p.picked || '') : '',
-      disabled: answered ? true : null, autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done'
-    });
-    control = h('div', { class: 'ans-wrap' + (answered ? (ok ? ' ok' : ' no') : '') }, input);
-  }
-
-  const rows = [h('div', { class: 'post' + (answered ? ' next' : ''), style: palStyle(p.hue) },
-    h('div', { class: 'post-av' }, av(p.hue, p.ic)),
-    h('div', { class: 'post-body' },
-      h('div', { class: 'qhead' }, h('span', { text: where }), h('span', { class: 'tag', text: d.label }), h('span', { class: 'tag soft', text: topicOf(q) })),
-      h('p', { class: 'q-text' + (d.big ? ' term' : ''), text: d.prompt }),
-      d.sub ? h('p', { class: 'q-sub', text: d.sub }) : null,
-      d.extra ? h('p', { class: 'q-sub ex', text: d.extra }) : null,
-      control))];
-
-  if (answered) {
-    const lines = [];
-    if (d.kind === 'ox') lines.push(h('div', { class: 'tags' }, h('span', { class: 'tag', text: `내 답 ${p.picked ? 'O' : 'X'}` }), h('span', { class: 'tag', text: `정답 ${d.correct ? 'O' : 'X'}` })));
-    else if (!ok) lines.push(h('p', { class: 'ansline' }, h('b', { text: '정답' }), h('span', { text: drillAnswer(d) })));
-    if (d.kind === 'short' && !ok) lines.unshift(h('p', { class: 'ansline' }, h('b', { text: '내 답' }), h('span', { text: String(p.picked || '(비움)') })));
-    if (q.type === 'word') lines.push(h('p', { class: 'ansline' }, h('b', { text: '뜻' }), h('span', { text: `${q.term} = ${q.meaning}` })));
-    if (q.type === 'word' && q.ex) lines.push(h('p', { class: 'muted' }, q.ex));
-    if (q.exp) lines.push(h('p', { text: q.exp }));
-    const wasRetired = q.done && seenOf(q) >= RETIRE_AT;
-    rows.push(h('div', { class: 'post sm reply prev ' + (ok ? 'ok' : 'no'), style: palStyle(p.hue), 'aria-live': 'polite' },
-      h('div', { class: 'post-av' }, h('span', { class: 'av ' + (ok ? 'good' : 'bad') }, icon(ok ? 'check' : 'close'))),
-      h('div', { class: 'post-body' },
-        h('div', { class: 'post-head' }, h('span', { class: 'post-title', text: ok ? (wasRetired ? '정답이에요 · 정복!' : '정답이에요') : '오답이에요' })),
-        ...lines,
-        !ok && d.kind === 'short' ? h('button', { type: 'button', class: 'btn sm outline fix', onclick: markCorrect }, icon('check'), '맞게 처리') : null)));
-  }
-
-  const body = h('div', null,
-    h('div', { class: 'progress', role: 'progressbar', 'aria-label': '진행도', 'aria-valuemin': 0, 'aria-valuemax': total, 'aria-valuenow': done }, h('span', { style: `width:${(done / total) * 100}%` })),
-    h('section', { class: 'qpost' }, rows));
-
-  let dock;
-  if (answered) dock = [h('button', { id: 'next', type: 'button', class: 'pbtn', onclick: next }, p.i + 1 >= total ? '결과 보기' : '다음', icon('chev'))];
-  else if (d.kind === 'ox') dock = [oxBtn(true), oxBtn(false)];
-  else if (d.kind === 'short') {
-    const go = h('button', { type: 'button', class: 'pbtn', 'aria-disabled': 'true', onclick: () => submit() }, '확인');
-    const submit = () => { const v = input.value.trim(); if (v) answer(v); };
-    input.addEventListener('input', () => go.setAttribute('aria-disabled', String(!input.value.trim())));
-    input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); submit(); } });
-    dock = [h('button', { type: 'button', class: 'glass gbtn narrow', onclick: () => answer('') }, '모르겠어요'), go];
-  } else dock = [];
-
-  screen({ title: p.title, inline: `${p.i + 1} / ${total}`, close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body, dock });
-  if (answered) requestAnimationFrame(() => { const n = document.getElementById('next'); if (n) n.focus({ preventScroll: true }); });
-  else if (input) input.focus({ preventScroll: true });   // synchronous, so it is still inside the tap that opened it
-}
-
-function renderResult() {
+function mountResult() {
   const p = play;
   const total = p.items.length, score = p.res.filter(r => r.ok).length;
   const pct = Math.round((score / total) * 100), wrong = p.res.filter(r => !r.ok);
   const msg = pct >= 90 ? '훌륭해요' : pct >= 70 ? '좋아요, 조금만 더' : '한 번 더 복습해 봐요';
-  const body = h('div', null,
-    h('section', { class: 'scorebox' }, ring(pct, true, `${pct}%`), h('p', { class: 'big', text: `${score} / ${total} 정답` }),
-      h('p', { class: 'sub' }, msg), p.retired ? h('p', { class: 'sub' }, st('check', `정복한 문제 ${p.retired}개`)) : null),
+  const box = h('section', { class: 'card tinted scorebox', style: palStyle(p.hue) },
+    ringEl(pct, { size: 168, w: 12, label: `${pct}%`, count: true }), h('p', { class: 'big', text: `${score} / ${total} 정답` }),
+    h('p', { class: 'sub' }, msg), p.retired ? h('div', { class: 'chips' }, chip('check', `정복한 문제 ${p.retired}개`)) : null);
+  const body = h('div', null, box,
     wrong.length ? h('div', { class: 'sec', text: `틀린 문제 ${wrong.length}개` }) : null,
-    wrong.length ? h('div', { class: 'rows' }, wrong.map(({ it, d }) => h('div', { class: 'row' }, qAvatar(it.q, 36),
+    wrong.length ? h('div', { class: 'card rows ' + (wrong.length > 14 ? 'lite long' : ''), style: 'margin-top:0' }, wrong.map(({ it, d }) => h('div', { class: 'row' }, qAvatar(it.q, 36),
       h('span', { class: 'row-body' }, h('span', { class: 'row-main' },
         h('span', { class: 'row-title', text: d.prompt }),
         h('span', { class: 'row-sub', text: `정답  ${drillAnswer(d)}` }),
@@ -1299,14 +1374,15 @@ function renderResult() {
   screen({
     title: '결과', inline: '결과', close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body,
     dock: wrong.length
-      ? [h('a', { class: 'glass gbtn narrow', href: p.back }, '나가기'), h('button', { type: 'button', class: 'pbtn', onclick: () => restart('wrong') }, icon('retry'), '틀린 것만')]
-      : [h('button', { type: 'button', class: 'glass gbtn narrow', onclick: () => restart(p.mode) }, icon('retry'), '다시'), h('a', { class: 'pbtn', href: p.back }, '완료')]
+      ? [h('a', { class: 'gbtn glass narrow lit', href: p.back }, '나가기'), h('button', { type: 'button', class: 'pbtn lit', onclick: () => restart('wrong') }, icon('retry'), '틀린 것만')]
+      : [h('button', { type: 'button', class: 'gbtn glass narrow lit', onclick: () => restart(p.mode) }, icon('retry'), '다시'), h('a', { class: 'pbtn lit', href: p.back }, '완료')]
   });
+  if (pct >= 90) setTimeout(() => burst(box, { n: 34, y: 0.34 }), 520);
 }
 
 document.addEventListener('keydown', ev => {
-  if (ev.key === 'Escape') closeMenu();
-  if (!play || play.done || $sheet.open || ev.ctrlKey || ev.metaKey || ev.altKey || isTyping()) return;
+  if (ev.key === 'Escape') { if (sheets.length) closeSheet(); else closeMenu(); }
+  if (!play || play.done || sheets.length || ev.ctrlKey || ev.metaKey || ev.altKey || isTyping()) return;
   const d = play.drills[play.i];
   if (d.kind === 'ox') { if (ev.code === 'KeyO') answer(true); else if (ev.code === 'KeyX') answer(false); }
   else if (d.kind === 'mc' && /^[1-5]$/.test(ev.key) && +ev.key <= d.choices.length) answer(+ev.key - 1);
@@ -1315,16 +1391,31 @@ document.addEventListener('keydown', ev => {
 /* =====================================================================
    router
    ===================================================================== */
-const scrollMem = {};
-let routeKey = '';
-if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+const DEPTH = { '': 0, wrong: 0, history: 0, settings: 0, s: 1, make: 1, e: 2, p: 3 };
+let prevMeta = null;
+function metaOf(hash) {
+  const [k] = hash.replace(/^#\/?/, '').split('/');
+  const depth = DEPTH[k] ?? 0;
+  return { hash, depth, tab: depth === 0 ? Math.max(0, TABS.findIndex(t => t[3] === '#/' + (k || ''))) : -1 };
+}
+function direction(prev, next) {
+  if (!prev) return 'init';
+  if (next.depth > prev.depth) return 'push';
+  if (next.depth < prev.depth) return 'pop';
+  if (next.depth === 0 && next.tab !== prev.tab) return next.tab > prev.tab ? 'tab-r' : 'tab-l';
+  return 'swap';
+}
 
 function route(keepScroll) {
-  closeSheet();
-  closeMenu();
+  closeAllSheets();
+  closeMenu(true);
+  clearInterval(makeClock);
   const hash = location.hash || '#/';
-  const [k, a, b] = hash.replace(/^#\/?/, '').split('/');
+  const [k, a, b, c] = hash.replace(/^#\/?/, '').split('/');
   if (k !== 'p') play = null;
+  const meta = metaOf(hash);
+  const dir = keepScroll === true ? 'replace' : direction(prevMeta, meta);
+  navCtx = { dir, y: dir === 'push' || dir === 'init' ? 0 : (scrollMem[hash] || 0) };
   const bad = () => { location.replace('#/'); };
   if (k === 's') {
     const s = findSubject(a);
@@ -1337,16 +1428,14 @@ function route(keepScroll) {
   } else if (k === 'p') {
     const mode = b === 'wrong' ? 'wrong' : 'all';
     if (!play || play.eid !== a || play.mode !== mode) if (!startPlay(a, mode)) return;
-    renderPlay();
-  } else if (k === 'wrong') viewWrong();
+    navCtx.y = 0;
+    mountPlay();
+  } else if (k === 'make') viewMake(a, b, c);
+  else if (k === 'wrong') viewWrong();
   else if (k === 'history') viewHistory();
   else if (k === 'settings') viewSettings();
   else viewHome();
-  if (keepScroll !== true) {
-    routeKey = hash;
-    window.scrollTo(0, k === 'p' ? 0 : (scrollMem[hash] || 0));
-    if (!reduceMotion()) $view.animate([{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: 'cubic-bezier(.2,.8,.2,1)' });
-  }
+  if (keepScroll !== true) { routeKey = hash; prevMeta = meta; }
   flushPending();
 }
 window.addEventListener('hashchange', () => route());
@@ -1355,10 +1444,12 @@ window.addEventListener('hashchange', () => route());
    start
    ===================================================================== */
 buildNav();
+initTouchFx();
 syncViewport();
 route();
 syncLibrary();
 checkUpdate();
+armWait();
 try {
-  if (sessionStorage.getItem('study.updated')) { sessionStorage.removeItem('study.updated'); toast('새 버전으로 업데이트했어요'); }
+  if (sessionStorage.getItem('study.updated')) { sessionStorage.removeItem('study.updated'); toast('새 버전으로 업데이트했어요', { icon: 'sparkle' }); }
 } catch { /* private mode */ }

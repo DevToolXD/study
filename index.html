@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#EDF0F8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#07080D" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="공부방">
@@ -18,19 +18,21 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<div class="wash" aria-hidden="true"></div>
+<div class="ambient" aria-hidden="true"><div class="amb a"></div><div class="amb b"></div></div>
 <div class="hinge" aria-hidden="true"></div>
 <nav id="nav" class="nav" aria-label="메인 메뉴"></nav>
-<div class="stage">
+<div class="stage" id="stage">
   <header class="toolbar"><div id="tb" class="tb-inner"></div></header>
   <main id="view" class="view"></main>
 </div>
 <div class="edge edge-top" aria-hidden="true"></div>
 <div class="edge edge-bottom" aria-hidden="true"></div>
 <div id="dock" class="dock"></div>
-<dialog id="sheet"></dialog>
-<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="layer" class="layer"></div>
+<div id="toast" class="glass toast" role="status" aria-live="polite"></div>
 <script src="icons.js"></script>
+<script src="engine.js"></script>
+<script src="kit.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
