@@ -2,25 +2,35 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="공부방">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
 <title>공부방</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <div class="wash" aria-hidden="true"></div>
+<div class="hinge" aria-hidden="true"></div>
+<nav id="nav" class="nav" aria-label="메인 메뉴"></nav>
+<div class="stage">
+  <header class="toolbar"><div id="tb" class="tb-inner"></div></header>
+  <main id="view" class="view"></main>
+</div>
 <div class="edge edge-top" aria-hidden="true"></div>
 <div class="edge edge-bottom" aria-hidden="true"></div>
-<header class="toolbar"><div id="tb" class="tb-inner"></div></header>
-<main id="view" class="view"></main>
 <div id="dock" class="dock"></div>
 <dialog id="sheet"></dialog>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="icons.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
