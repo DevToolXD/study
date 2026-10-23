@@ -25,6 +25,7 @@ const ICONS = {
   xcircle: '<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>',
   checkcircle: '<circle cx="12" cy="12" r="9"/><path d="M8 12.500l2.800 2.800L16 9.800"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.500M12 7.600h.01" stroke-width="2.200"/>',
+  list: '<path d="M9.500 6h10.500M9.500 12h10.500M9.500 18h10.500"/><circle cx="4.800" cy="6" r="1.100" fill="currentColor" stroke="none"/><circle cx="4.800" cy="12" r="1.100" fill="currentColor" stroke="none"/><circle cx="4.800" cy="18" r="1.100" fill="currentColor" stroke="none"/>',
   sparkle: '<path d="M11 3.500l1.900 5.600 5.600 1.900-5.600 1.900L11 18.500l-1.900-5.600L3.500 11l5.600-1.900z"/><path d="M19 15.500l.8 2.200 2.200.8-2.200.8-.8 2.200-.8-2.200-2.200-.8 2.200-.8z"/>',
 
   /* subject glyphs (picked in the subject sheet) */

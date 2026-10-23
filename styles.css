@@ -101,8 +101,9 @@ input::selection, textarea::selection { background: color-mix(in srgb, var(--acc
 img, svg, a { -webkit-user-drag: none; }
 html {
   -webkit-text-size-adjust: 100%;
-  touch-action: manipulation;      /* no double-tap zoom */
+  touch-action: pan-x pan-y;       /* scroll only: no pinch zoom, no double-tap zoom ("manipulation" still allows pinch) */
   background: var(--bg);
+  overflow-x: hidden;
 }
 body {
   margin: 0;
@@ -113,11 +114,14 @@ body {
   font: 400 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  touch-action: pan-x pan-y;
+  overflow-x: hidden;
+  max-width: 100%;
 }
 body:has(dialog[open]) { overflow: hidden; }
 h1, h2, h3, p { margin: 0; }
 a { color: inherit; text-decoration: none; }
-button, input, textarea { font: inherit; color: inherit; touch-action: manipulation; }
+button, input, textarea { font: inherit; color: inherit; touch-action: pan-x pan-y; }
 button { cursor: pointer; -webkit-appearance: none; appearance: none; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 [hidden] { display: none !important; }
@@ -225,12 +229,13 @@ body:not(.detail) .edge-bottom, body.has-dock .edge-bottom { display: block; }
 
 /* bottom action bar on detail screens */
 .dock {
-  position: fixed; left: var(--nav-w); right: 0; bottom: calc(var(--safe-b) + 12px); z-index: 20;
+  position: fixed; left: var(--nav-w); right: 0; bottom: calc(var(--safe-b) + 12px + var(--kb, 0px)); z-index: 20;
   max-width: 720px; margin-inline: auto; padding: 0 max(16px, var(--safe-r)) 0 16px;
   display: flex; gap: 12px; align-items: center; pointer-events: none;
 }
 .dock > * { pointer-events: auto; }
 .dock:empty { display: none; }
+body.kb-open .dock { bottom: calc(12px + var(--kb)); }   /* sit on top of the keyboard instead of behind it */
 .dock .gbtn, .dock .pbtn { flex: 1; }
 .dock .gbtn.narrow { flex: 0 0 auto; }
 
@@ -520,6 +525,49 @@ button.srow:active, a.srow:active { background: var(--fill); }
 .note { padding: 12px 16px 14px; font-size: 13.5px; line-height: 1.55; color: var(--text2); }
 .note code { font: 600 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 6px; border-radius: 6px; background: var(--fill); color: var(--text); }
 
+/* ---------- multiple choice, typed answers, topic bars ---------- */
+.choices { display: grid; gap: 8px; margin: 12px 0 6px; }
+.choice { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 54px; padding: 10px 14px; border: 0; border-radius: 16px; background: var(--bg2); text-align: left; font-size: 16.5px; font-weight: 600; line-height: 1.35; }
+.choice:active { background: var(--fill2); }
+.choice .cn, .ch .cn { flex: none; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--fill2); font-size: 13px; font-weight: 800; }
+.choice .ct { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.choice .ico { font-size: 20px; }
+.choice.ok { background: var(--good-soft); box-shadow: inset 0 0 0 2px var(--good); }
+.choice.no { background: var(--bad-soft); box-shadow: inset 0 0 0 2px var(--bad); }
+.choice.ok .ico { color: var(--good); }
+.choice.no .ico { color: var(--bad); }
+.choice.off { opacity: .55; }
+.choice[aria-disabled="true"] { pointer-events: none; }
+.ans-wrap { margin: 12px 0 6px; border-radius: 16px; background: var(--bg2); }
+.ans-wrap:focus-within { box-shadow: inset 0 0 0 2px var(--accent); }
+.ans-wrap.ok { background: var(--good-soft); box-shadow: inset 0 0 0 2px var(--good); }
+.ans-wrap.no { background: var(--bad-soft); box-shadow: inset 0 0 0 2px var(--bad); }
+.ans-input { display: block; width: 100%; padding: 15px 16px; border: 0; border-radius: 16px; background: none; font-size: 20px; font-weight: 600; outline: none; }
+.ans-input::placeholder { color: var(--text); opacity: .4; }
+.q-sub { margin: -2px 0 6px; font-size: 15px; line-height: 1.5; color: var(--text2); overflow-wrap: anywhere; }
+.q-text.term { font-size: 34px; letter-spacing: -.03em; }
+.tag.soft { background: var(--accent-soft); color: var(--accent); }
+.ansline { display: flex; gap: 10px; margin-top: 4px; font-size: 15.5px; line-height: 1.45; }
+.ansline b { flex: none; color: var(--text2); font-weight: 700; }
+.ansline span { font-weight: 700; overflow-wrap: anywhere; }
+.reply .fix { margin-top: 10px; }
+.cmd { margin-top: 6px; }
+.cmd code { display: inline-block; max-width: 100%; padding: 9px 13px; border-radius: 12px; background: var(--fill); font: 600 13px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; overflow-wrap: anywhere; user-select: none; }
+.callout.col { flex-direction: column; align-items: flex-start; }
+.callout.col p { font-size: 14px; line-height: 1.55; }
+.callout.col code { font: 600 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 6px; border-radius: 6px; background: var(--fill); }
+.bar { display: block; height: 4px; margin-top: 7px; border-radius: 2px; background: var(--fill2); overflow: hidden; }
+.bar span { display: block; height: 100%; border-radius: 2px; background: var(--text); }
+.row.static:active { background: none; }
+.row.dn, .rows.done .row { opacity: .55; }
+.togg { display: flex; margin: 18px auto 0; }
+.note.flat { padding: 12px 2px 0; }
+.srow .seg { flex: none; width: 190px; }
+.srow .seg button { height: 32px; font-size: 14px; }
+.qview .ch { display: flex; gap: 10px; align-items: center; margin: 0; font-size: 16px; }
+.qview .ch.on { font-weight: 800; }
+.qview .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+
 /* ---------- popover menu (macOS context menu, as glass) ---------- */
 .menu-scrim { position: fixed; inset: 0; z-index: 50; }
 .menu {
@@ -546,6 +594,7 @@ button.srow:active, a.srow:active { background: var(--fill); }
   box-shadow: 0 24px 60px rgba(0, 0, 0, .35), inset 0 0 0 .5px var(--hair), inset 0 1px 1px rgba(255, 255, 255, .5);
 }
 @media (min-width: 640px) { #sheet { margin: auto; } }
+body.kb-open #sheet { margin: auto auto calc(var(--kb) + 10px); max-height: calc(var(--vvh, 100dvh) - 24px); }   /* fit above the keyboard, no page panning */
 #sheet[open] { animation: sheet-in .44s var(--ease); }
 #sheet[open]::backdrop { animation: fade .3s; }
 #sheet::backdrop { background: rgba(8, 10, 18, .4); }  /* dim the backdrop, not the sheet */

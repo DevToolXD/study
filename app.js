@@ -5,6 +5,9 @@
    ===================================================================== */
 const KEY = 'study.v1';
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-3);
+const RETIRE_AT = 6;                       // a question solved this many times (and answered right last) is mastered
+const SIZES = [10, 20, 30, 50];
+const TYPE_LABEL = { ox: 'OX', mc: '객관식', short: '주관식', word: '단어' };
 
 /* older saves used emoji as subject icons; map them to the drawn glyphs once */
 const EMOJI_ICON = {
@@ -14,10 +17,11 @@ const EMOJI_ICON = {
   '✏': 'pencil', '\u{1F9E0}': 'bulb', '⚽': 'ball'
 };
 
-const freshDb = () => ({ subjects: [], shuffle: true, hiddenLib: { exams: {} }, sync: { rev: '', at: 0, count: 0 } });
+const freshDb = () => ({ subjects: [], size: 20, hiddenLib: { exams: {} }, sync: { rev: '', at: 0, count: 0 } });
 function migrate(d) {
   const out = Object.assign(freshDb(), d);
   if (!out.hiddenLib || !out.hiddenLib.exams) out.hiddenLib = { exams: {} };
+  if (!SIZES.includes(out.size)) out.size = 20;
   for (const s of out.subjects) {
     if (!s.icon) s.icon = EMOJI_ICON[String(s.emoji || '').replace(/️/g, '')] || 'book';
     delete s.emoji;
@@ -25,6 +29,10 @@ function migrate(d) {
     for (const e of s.exams) {
       e.questions = Array.isArray(e.questions) ? e.questions : [];
       e.attempts = Array.isArray(e.attempts) ? e.attempts : [];
+      for (const q of e.questions) {
+        if (!q.type) q.type = 'ox';
+        if (q.seen === undefined) q.seen = q.last === undefined ? 0 : Math.max(1, (q.miss || 0) + (q.last ? 1 : 0));
+      }
     }
   }
   return out;
@@ -70,6 +78,7 @@ const $sheet = document.getElementById('sheet');
 const $toast = document.getElementById('toast');
 const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const finePointer = () => matchMedia('(hover: hover) and (pointer: fine)').matches;
 
 let toastTimer;
 function toast(msg) {
@@ -89,6 +98,11 @@ function ago(t) {
   if (s < 3600) return Math.round(s / 60) + '분 전';
   if (s < 86400) return Math.round(s / 3600) + '시간 전';
   return Math.round(s / 86400) + '일 전';
+}
+function shuffle(a) {
+  const r = a.slice();
+  for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; }
+  return r;
 }
 
 /* =====================================================================
@@ -113,19 +127,29 @@ function findExam(id) {
   }
   return null;
 }
+const topicOf = q => q.topic || (q.type === 'word' ? '단어' : '일반');
+const seenOf = q => q.seen || 0;
+const activeQs = e => e.questions.filter(q => !q.done);
+const doneCount = e => e.questions.length - activeQs(e).length;
+const unitOf = e => (e.kind === 'vocab' ? '단어' : '문제');
+const wrongCount = e => activeQs(e).filter(q => q.last === false).length;
 const lastScore = e => {
   const a = e.attempts[e.attempts.length - 1];
   return a ? Math.round((a.score / a.total) * 100) : null;
 };
-const wrongCount = e => e.questions.filter(q => q.last === false).length;
-const subjQ = s => s.exams.reduce((n, e) => n + e.questions.length, 0);
+const subjQ = s => s.exams.reduce((n, e) => n + activeQs(e).length, 0);
 function subjAcc(s) {
   const sc = s.exams.map(lastScore).filter(x => x !== null);
   return sc.length ? Math.round(sc.reduce((a, b) => a + b, 0) / sc.length) : null;
 }
+function examAcc(e) {
+  let seen = 0, miss = 0;
+  for (const q of e.questions) { seen += seenOf(q); miss += q.miss || 0; }
+  return seen ? Math.round(((seen - miss) / seen) * 100) : null;
+}
 function allWrong() {
   const out = [];
-  for (const s of db.subjects) for (const e of s.exams) for (const q of e.questions) if (q.last === false) out.push({ s, e, q });
+  for (const s of db.subjects) for (const e of s.exams) for (const q of e.questions) if (!q.done && q.last === false) out.push({ s, e, q });
   return out;
 }
 function allAttempts() {
@@ -135,17 +159,147 @@ function allAttempts() {
 }
 const libCount = () => db.subjects.reduce((n, s) => n + s.exams.reduce((m, e) => m + e.questions.filter(q => q.lib).length, 0), 0);
 
+/* what a question looks like in lists */
+const rowTitle = q => (q.type === 'word' ? q.term : q.q);
+function rowSub(q) {
+  const parts = [];
+  if (q.type === 'word') parts.push(q.meaning);
+  else parts.push(TYPE_LABEL[q.type] || 'OX');
+  parts.push(topicOf(q));
+  if (q.miss) parts.push(`틀림 ${q.miss}`);
+  return parts.join(' · ');
+}
+function answerText(q) {
+  if (q.type === 'ox') return q.a ? 'O' : 'X';
+  if (q.type === 'mc') return q.choices[q.a];
+  if (q.type === 'short') return q.a;
+  return `${q.term} = ${q.meaning}`;
+}
+
 /* deleting something that came from the CLI hides it on this device, so a sync doesn't bring it back */
+const libKey = e => e.libId || e.id;
 function removeExam(s, e) {
-  if (e.lib) db.hiddenLib.exams[e.id] = 1;
+  if (e.lib) db.hiddenLib.exams[libKey(e)] = 1;
   s.exams = s.exams.filter(x => x !== e);
   save();
 }
 function removeSubject(s) {
-  s.exams.forEach(e => { if (e.lib) db.hiddenLib.exams[e.id] = 1; });
+  s.exams.forEach(e => { if (e.lib) db.hiddenLib.exams[libKey(e)] = 1; });
   db.subjects = db.subjects.filter(x => x !== s);
   save();
 }
+
+/* =====================================================================
+   what to ask next: topics the learner misses more often come up more often,
+   fresh questions get a turn, mastered ones drop out
+   ===================================================================== */
+function topicStats(qs) {
+  const t = {};
+  for (const q of qs) {
+    const s = t[topicOf(q)] || (t[topicOf(q)] = { a: 0, w: 0, n: 0, done: 0 });
+    s.a += seenOf(q); s.w += q.miss || 0;
+    if (q.done) s.done++; else s.n++;
+  }
+  return t;
+}
+function weightOf(q, ts) {
+  const t = ts[topicOf(q)] || { a: 0, w: 0 };
+  const et = (t.w + 1) / (t.a + 2.5);                              // topic error rate, smoothed toward ~0.4
+  const seen = seenOf(q), miss = q.miss || 0;
+  const eq = seen ? (miss + 0.5) / (seen + 1.5) : 0.45;            // this question's own error rate
+  let w = (0.2 + 1.8 * et) * (0.5 + eq);
+  if (!seen) w *= 1.25;                                            // fresh questions enter the rotation
+  if (q.last === false) w *= 1.8;                                  // missed last time
+  if (seen >= 4 && q.last === true) w *= 0.6;                      // nearly mastered
+  if (q.at && Date.now() - q.at < 120000) w *= 0.2;                // just seen
+  return w;
+}
+function pickSession(pool, n) {
+  const cache = new Map();
+  const tsOf = e => { if (!cache.has(e)) cache.set(e, topicStats(e.questions)); return cache.get(e); };
+  return pool
+    .map(it => ({ it, k: Math.pow(Math.random(), 1 / Math.max(0.02, weightOf(it.q, tsOf(it.e)))) }))
+    .sort((a, b) => b.k - a.k).slice(0, n).map(x => x.it);
+}
+function recordAnswer(q, ok) {
+  q.seen = seenOf(q) + 1;
+  if (!ok) q.miss = (q.miss || 0) + 1;
+  q.last = ok;
+  q.at = Date.now();
+  if (q.seen >= RETIRE_AT && ok) q.done = true;
+}
+
+/* ---------- answer matching for typed answers ---------- */
+function normAns(s) {
+  return String(s ?? '').normalize('NFKC').toLowerCase().replace(/−/g, '-').replace(/\s+/g, '').replace(/[.,;。]+$/, '');
+}
+function numVal(s) {
+  const t = s.replace(/,/g, '');
+  let m = /^([+-]?\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/.exec(t);
+  if (m) return Number(m[2]) ? Number(m[1]) / Number(m[2]) : null;
+  m = /^([+-]?(?:\d+\.?\d*|\.\d+))%?$/.exec(t);
+  return m ? Number(m[1]) : null;
+}
+function answerForms(s) {
+  const n = normAns(s), set = new Set([n]);
+  const eq = /^[a-z]{1,2}=(.+)$/.exec(n);                         // "x=3" also counts as "3"
+  if (eq) set.add(eq[1]);
+  const u = /^([+-]?[\d.,/]+)(cm|mm|km|m|kg|g|ml|l|개|명|원|도|°|℃|점|번|살|초|분|시간|%)$/.exec(n);   // "12cm" also counts as "12"
+  if (u) set.add(u[1]);
+  return set;
+}
+function sameAnswer(a, b) {
+  for (const x of answerForms(a)) for (const y of answerForms(b)) {
+    if (x === y) return true;
+    const nx = numVal(x), ny = numVal(y);
+    if (nx !== null && ny !== null && Math.abs(nx - ny) <= 1e-9 * Math.max(1, Math.abs(nx))) return true;
+  }
+  return false;
+}
+const matchesAny = (val, answers) => String(val ?? '').trim() !== '' && answers.some(a => sameAnswer(val, a));
+
+/* ---------- a question becomes a drill: what is shown and how it is answered ---------- */
+function blankHint(term) { return [...term].map((c, i) => (i === 0 || /[\s\-']/.test(c) ? c : '_')).join(' '); }
+function cloze(ex, term) {
+  if (!ex) return '';
+  return ex.replace(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'), '____');
+}
+function makeWordDrill(q, e) {
+  const seen = seenOf(q), others = e.questions.filter(x => x.type === 'word' && x !== q);
+  const distractors = field => {
+    const sameKind = others.filter(w => w.pos && w.pos === q.pos);
+    const uniq = [], seenVals = new Set([normAns(q[field])]);
+    for (const w of [...shuffle(sameKind), ...shuffle(others)]) {
+      const k = normAns(w[field]);
+      if (!seenVals.has(k)) { seenVals.add(k); uniq.push(w[field]); }
+    }
+    return uniq.slice(0, 3);
+  };
+  const stage = seen < 2 ? 0 : seen < 4 ? 1 : 2;     // 2 + 2 + 2 = the six solves that retire a word
+  if (stage === 0) {
+    const d = distractors('meaning');
+    if (d.length >= 2) { const choices = shuffle([q.meaning, ...d]); return { kind: 'mc', label: '단어', prompt: q.term, sub: q.pos || '뜻을 골라요', choices, correct: choices.indexOf(q.meaning), big: true }; }
+  } else if (stage === 1) {
+    const d = distractors('term');
+    if (d.length >= 2) { const choices = shuffle([q.term, ...d]); return { kind: 'mc', label: '단어', prompt: q.meaning, sub: '알맞은 단어를 골라요', choices, correct: choices.indexOf(q.term) }; }
+  }
+  return { kind: 'short', label: '단어', prompt: q.meaning, sub: [q.pos, blankHint(q.term)].filter(Boolean).join('  '), extra: cloze(q.ex, q.term), answers: [q.term] };
+}
+function makeDrill(it) {
+  const { q, e } = it;
+  if (q.type === 'ox') return { kind: 'ox', label: 'OX', prompt: q.q, correct: q.a };
+  if (q.type === 'mc') {
+    const order = shuffle(q.choices.map((_, i) => i));
+    return { kind: 'mc', label: '객관식', prompt: q.q, choices: order.map(i => q.choices[i]), correct: order.indexOf(q.a) };
+  }
+  if (q.type === 'short') return { kind: 'short', label: '주관식', prompt: q.q, answers: [q.a, ...(q.alts || [])] };
+  return makeWordDrill(q, e);
+}
+function checkDrill(d, val) {
+  if (d.kind === 'ox' || d.kind === 'mc') return val === d.correct;
+  return matchesAny(val, d.answers);
+}
+const drillAnswer = d => (d.kind === 'ox' ? (d.correct ? 'O' : 'X') : d.kind === 'mc' ? d.choices[d.correct] : d.answers[0]);
 
 /* =====================================================================
    Claude CLI connection: data/library.json is written by tools/quiz.mjs
@@ -154,6 +308,40 @@ function removeSubject(s) {
 const ID_RE = /^[A-Za-z0-9_-]{1,48}$/;
 const clip = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
 const normName = v => String(v || '').trim().toLowerCase().replace(/\s+/g, '');
+const KINDS = ['vocab', 'math', 'quiz'];
+const QKEYS = ['type', 'q', 'a', 'choices', 'alts', 'term', 'meaning', 'pos', 'ex', 'topic', 'exp'];
+
+function cleanQuestion(q) {
+  if (!q || !ID_RE.test(q.id)) return null;
+  const type = String(q.type || 'ox');
+  const base = { id: q.id, type, topic: clip(q.topic, 24), exp: clip(q.exp, 300) };
+  if (type === 'word') {
+    const term = clip(q.term, 80), meaning = clip(q.meaning, 160);
+    if (!term || !meaning) return null;
+    const out = { ...base, term, meaning };
+    if (clip(q.pos, 12)) out.pos = clip(q.pos, 12);
+    if (clip(q.ex, 200)) out.ex = clip(q.ex, 200);
+    return out;
+  }
+  const text = clip(q.q, 400);
+  if (!text) return null;
+  if (type === 'ox') return typeof q.a === 'boolean' ? { ...base, q: text, a: q.a } : null;
+  if (type === 'mc') {
+    const ch = Array.isArray(q.choices) ? q.choices.map(c => clip(c, 160)) : [];
+    if (ch.length < 2 || ch.length > 5 || ch.some(c => !c) || new Set(ch).size !== ch.length) return null;
+    if (!Number.isInteger(q.a) || q.a < 0 || q.a >= ch.length) return null;
+    return { ...base, q: text, choices: ch, a: q.a };
+  }
+  if (type === 'short') {
+    const a = clip(q.a, 120);
+    if (!a) return null;
+    const out = { ...base, q: text, a };
+    const alts = (Array.isArray(q.alts) ? q.alts : []).map(x => clip(x, 120)).filter(Boolean).slice(0, 6);
+    if (alts.length) out.alts = alts;
+    return out;
+  }
+  return null;
+}
 
 function cleanLibrary(raw) {
   const out = [];
@@ -165,23 +353,24 @@ function cleanLibrary(raw) {
       if (!e || !ID_RE.test(e.id) || !clip(e.name, 40)) continue;
       const qs = [], seen = new Set();
       for (const q of Array.isArray(e.questions) ? e.questions : []) {
-        if (!q || !ID_RE.test(q.id) || seen.has(q.id)) continue;
-        if ((q.type || 'ox') !== 'ox') continue;          // the app plays OX for now
-        const text = clip(q.q, 400);
-        if (!text || typeof q.a !== 'boolean') continue;
-        seen.add(q.id);
-        qs.push({ id: q.id, q: text, a: q.a, exp: clip(q.exp, 300) });
+        const c = cleanQuestion(q);
+        if (!c || seen.has(c.id)) continue;
+        seen.add(c.id);
+        qs.push(c);
       }
-      exams.push({ id: e.id, name: clip(e.name, 40), questions: qs });
+      exams.push({ id: e.id, name: clip(e.name, 40), kind: KINDS.includes(e.kind) ? e.kind : 'quiz', questions: qs });
     }
     out.push({ id: s.id, name: clip(s.name, 24), icon: SUBJECT_ICONS.includes(s.icon) ? s.icon : 'book', hue: HUES.includes(s.color) ? s.color : 215, exams });
   }
   return out;
 }
 
+const sameContent = (a, b) => QKEYS.every(k => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+function applyContent(q, lq) { for (const k of QKEYS) { if (lq[k] === undefined) delete q[k]; else q[k] = lq[k]; } }
+
 function mergeLibrary(lib) {
   let added = 0, changed = false;
-  const liveExamIds = new Set();
+  const live = new Set();
   for (const ls of lib) {
     const visible = ls.exams.filter(e => !db.hiddenLib.exams[e.id]);
     if (!visible.length) continue;
@@ -192,18 +381,23 @@ function mergeLibrary(lib) {
       changed = true;
     }
     for (const le of visible) {
-      liveExamIds.add(le.id);
-      let exam = subj.exams.find(e => e.id === le.id);
+      live.add(le.id);
+      /* an exam the learner made by hand with the same name is filled in rather than duplicated */
+      let exam = subj.exams.find(e => e.id === le.id || e.libId === le.id) || subj.exams.find(e => !e.lib && normName(e.name) === normName(le.name));
       if (!exam) {
-        exam = { id: le.id, name: le.name, questions: [], attempts: [], lib: true };
+        exam = { id: le.id, name: le.name, kind: le.kind, questions: [], attempts: [], lib: true };
         subj.exams.push(exam);
         changed = true;
-      } else if (exam.lib && exam.name !== le.name) { exam.name = le.name; changed = true; }
+      } else {
+        if (!exam.lib) { exam.lib = true; if (exam.id !== le.id) exam.libId = le.id; changed = true; }
+        if (exam.name !== le.name) { exam.name = le.name; changed = true; }
+        if (exam.kind !== le.kind) { exam.kind = le.kind; changed = true; }
+      }
       const ids = new Set(le.questions.map(q => q.id));
       for (const lq of le.questions) {
         const q = exam.questions.find(x => x.id === lq.id);
-        if (!q) { exam.questions.push({ id: lq.id, q: lq.q, a: lq.a, exp: lq.exp, lib: true }); added++; changed = true; }
-        else if (q.lib && (q.q !== lq.q || q.a !== lq.a || q.exp !== lq.exp)) { Object.assign(q, { q: lq.q, a: lq.a, exp: lq.exp }); changed = true; }
+        if (!q) { exam.questions.push({ ...lq, lib: true, seen: 0 }); added++; changed = true; }
+        else if (q.lib && !sameContent(q, lq)) { applyContent(q, lq); changed = true; }
       }
       const before = exam.questions.length;
       exam.questions = exam.questions.filter(q => !q.lib || ids.has(q.id));
@@ -212,7 +406,7 @@ function mergeLibrary(lib) {
   }
   /* exams the CLI removed from the library disappear here too */
   for (const s of db.subjects) {
-    const keep = s.exams.filter(e => !e.lib || liveExamIds.has(e.id));
+    const keep = s.exams.filter(e => !e.lib || live.has(libKey(e)));
     if (keep.length !== s.exams.length) { s.exams = keep; changed = true; }
   }
   const emptyLib = db.subjects.filter(s => s.lib && !s.exams.length);
@@ -311,14 +505,46 @@ function flushPending() {
 }
 
 /* =====================================================================
-   no pinch zoom, no long-press selection (inputs keep normal editing)
+   no pinch zoom, no long-press selection (inputs keep normal editing),
+   and a viewport that follows the keyboard instead of letting iOS pan it
    ===================================================================== */
 const editable = el => !!(el && el.closest && el.closest('input, textarea'));
+const isTyping = () => { const a = document.activeElement; return !!(a && /^(INPUT|TEXTAREA)$/.test(a.tagName)); };
 ['gesturestart', 'gesturechange', 'gestureend'].forEach(t => document.addEventListener(t, e => e.preventDefault(), { passive: false }));
 document.addEventListener('selectstart', e => { const el = e.target.nodeType === 1 ? e.target : e.target.parentElement; if (!editable(el)) e.preventDefault(); });
 document.addEventListener('contextmenu', e => { if (!editable(e.target)) e.preventDefault(); });
 document.addEventListener('dragstart', e => e.preventDefault());
 document.addEventListener('wheel', e => { if (e.ctrlKey) e.preventDefault(); }, { passive: false });
+
+const vv = window.visualViewport;
+let zoomResetAt = 0;
+function resetZoom() {                                    // if iOS zoomed in anyway, snap back to 1x
+  const now = Date.now();
+  if (now - zoomResetAt < 800) return;
+  zoomResetAt = now;
+  const m = document.querySelector('meta[name=viewport]');
+  if (!m) return;
+  const orig = m.getAttribute('content');
+  m.setAttribute('content', 'width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover');
+  setTimeout(() => m.setAttribute('content', orig), 150);
+}
+function syncViewport() {
+  if (!vv) return;
+  const root = document.documentElement.style;
+  if (vv.scale > 1.02) {
+    root.setProperty('--kb', '0px');
+    document.body.classList.remove('kb-open');
+    if (!isTyping()) resetZoom();
+    return;
+  }
+  const kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+  const open = kb > 80;                                   // smaller changes are just the browser bar
+  root.setProperty('--kb', (open ? kb : 0) + 'px');
+  root.setProperty('--vvh', Math.round(vv.height) + 'px');
+  document.body.classList.toggle('kb-open', open);
+}
+if (vv) { vv.addEventListener('resize', syncViewport); vv.addEventListener('scroll', syncViewport); }
+window.addEventListener('orientationchange', () => setTimeout(syncViewport, 350));
 
 /* =====================================================================
    shell: navigation, toolbar, screen
@@ -405,6 +631,11 @@ function screen(o) {
    ===================================================================== */
 const av = (hue, name, cls) => h('span', { class: 'av ' + (cls || ''), style: palStyle(hue), 'aria-hidden': 'true' }, icon(name));
 const oxAv = (q, size) => h('span', { class: 'av ' + (q.a ? 'o' : 'x'), style: size ? `--av:${size}px` : null, 'aria-label': q.a ? '정답 O' : '정답 X', text: q.a ? 'O' : 'X' });
+function qAvatar(q, size) {
+  if (q.type === 'ox') return oxAv(q, size);
+  const ic = q.type === 'word' ? 'type' : q.type === 'mc' ? 'list' : 'pencil';
+  return h('span', { class: 'av ghost', style: size ? `--av:${size}px` : null, 'aria-label': TYPE_LABEL[q.type] }, icon(ic));
+}
 const st = (ic, text) => h('span', { class: 'st' }, icon(ic), text);
 const dim = name => icon(name, 'chev');
 const code = t => h('code', { text: t });
@@ -488,8 +719,9 @@ function openSheet({ title, body, submit = '저장', danger = false, cancel = '�
   $sheet.replaceChildren(form);
   $sheet.setAttribute('aria-labelledby', 'sheet-title');
   if (!$sheet.open) $sheet.showModal();
+  /* on touch screens an automatic focus pops the keyboard mid-animation, which is what made iOS zoom and shove the sheet */
   const first = form.querySelector('input[type=text], textarea');
-  if (first) first.focus();
+  if (first && finePointer()) first.focus();
 }
 function confirmSheet(title, message, label, onYes) {
   openSheet({ title, body: h('p', { class: 'hint', text: message }), submit: label, danger: true, onSubmit: () => { onYes(); } });
@@ -503,10 +735,14 @@ function picker(items, initial, cls, onChange) {
   paint();
   return { el, get: () => cur };
 }
+const textField = (label, value, placeholder, max) => h('input', {
+  class: 'field', type: 'text', maxlength: max, 'aria-label': label, value: value || '', placeholder,
+  autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done'
+});
 
 function subjectSheet(subject) {
   const err = h('div', { class: 'err', role: 'alert' });
-  const name = h('input', { class: 'field', type: 'text', maxlength: 20, 'aria-label': '과목 이름', value: subject ? subject.name : '', placeholder: '예: 수학' });
+  const name = textField('과목 이름', subject && subject.name, '예: 수학', 20);
   let curIcon = subject ? sicon(subject) : SUBJECT_ICONS[0], curHue = subject ? subject.hue : HUES[0];
   const preview = h('div', { class: 'preview' });
   const paintPreview = () => preview.replaceChildren(av(curHue, curIcon));
@@ -538,11 +774,12 @@ function subjectSheet(subject) {
 
 function examSheet(subject, exam) {
   const err = h('div', { class: 'err', role: 'alert' });
-  const name = h('input', { class: 'field', type: 'text', maxlength: 30, 'aria-label': '시험·단원 이름', value: exam ? exam.name : '', placeholder: '예: 중간고사, 3단원' });
+  const name = textField('시험·단원 이름', exam && exam.name, '예: 중간고사, 3단원', 30);
   openSheet({
     title: exam ? '시험 편집' : '새 시험·단원',
     body: [
       group('이름', name),
+      h('p', { class: 'hint', text: '문제는 직접 쓰지 않아요. 터미널에서 같은 이름으로 사진을 넘기면 채워져요.' }),
       err,
       exam ? h('div', { class: 'sg' }, h('button', {
         type: 'button', class: 'arow danger',
@@ -559,43 +796,47 @@ function examSheet(subject, exam) {
   });
 }
 
+/* questions from the CLI are read-only here; only an old hand-written OX question can still be edited */
 function questionSheet(exam, q) {
-  if (q && q.lib) return questionView(q);
-  const text = h('textarea', { class: 'field', rows: 4, maxlength: 400, 'aria-label': '문장', placeholder: '예: 광합성은 엽록체에서 일어난다.', text: q ? q.q : '' });
-  const ans = picker([{ value: true, label: 'O  맞다', aria: 'O 맞다' }, { value: false, label: 'X  틀리다', aria: 'X 틀리다' }], q ? q.a : true, 'seg sheet-seg');
-  const exp = h('textarea', { class: 'field', rows: 2, maxlength: 300, 'aria-label': '해설', placeholder: '틀렸을 때 보여줄 설명 (선택)', text: q ? q.exp : '' });
+  if (!(q && !q.lib && q.type === 'ox')) return questionView(q);
+  const text = h('textarea', { class: 'field', rows: 4, maxlength: 400, 'aria-label': '문장', text: q.q });
+  const ans = picker([{ value: true, label: 'O  맞다', aria: 'O 맞다' }, { value: false, label: 'X  틀리다', aria: 'X 틀리다' }], q.a, 'seg sheet-seg');
+  const exp = h('textarea', { class: 'field', rows: 2, maxlength: 300, 'aria-label': '해설', placeholder: '해설 (선택)', text: q.exp });
   const err = h('div', { class: 'err', role: 'alert' });
   openSheet({
-    title: q ? '문제 편집' : '새 OX 문제',
+    title: '문제 편집',
     body: [
       group('문장', text),
       h('div', null, h('div', { class: 'glabel', text: '정답' }), h('div', { class: 'sg' }, ans.el)),
       group('해설', exp),
       err,
-      q ? h('div', { class: 'sg' }, h('button', {
+      h('div', { class: 'sg' }, h('button', {
         type: 'button', class: 'arow danger',
         onclick: () => { exam.questions = exam.questions.filter(x => x !== q); save(); closeSheet(); route(true); }
-      }, icon('trash'), '문제 삭제')) : null
+      }, icon('trash'), '문제 삭제'))
     ],
     onSubmit: () => {
       const t = text.value.trim();
       if (!t) { err.textContent = '문장을 입력해 주세요.'; text.focus(); return false; }
-      if (q) Object.assign(q, { q: t, a: ans.get(), exp: exp.value.trim() });
-      else exam.questions.push({ id: uid(), q: t, a: ans.get(), exp: exp.value.trim() });
+      Object.assign(q, { q: t, a: ans.get(), exp: exp.value.trim() });
       save(); route(true);
     }
   });
 }
-/* questions that came from the CLI are read-only here; the CLI is where they're edited */
 function questionView(q) {
+  const lines = [];
+  if (q.type === 'mc') q.choices.forEach((c, i) => lines.push(h('p', { class: 'ch' + (i === q.a ? ' on' : '') }, h('span', { class: 'cn', text: String(i + 1) }), h('span', { text: c }))));
   openSheet({
-    title: '문제', submit: null, cancel: '닫기',
+    title: TYPE_LABEL[q.type] || '문제', submit: null, cancel: '닫기',
     body: [
       h('div', { class: 'sg qview' },
-        h('p', { class: 'q', text: q.q }),
-        h('div', { class: 'a' }, oxAv(q, 28), h('span', { text: q.a ? '맞는 문장이에요' : '틀린 문장이에요' })),
-        q.exp ? h('p', { text: q.exp }) : null),
-      h('p', { class: 'hint', text: 'CLI에서 가져온 문제예요. 고치려면 터미널에서 수정해 주세요.' })
+        h('p', { class: 'q', text: q.type === 'word' ? q.term : q.q }),
+        ...lines,
+        h('div', { class: 'a' }, q.type === 'ox' ? oxAv(q, 28) : null, h('span', { text: q.type === 'mc' ? '' : `정답  ${answerText(q)}` })),
+        q.type === 'word' && q.ex ? h('p', { class: 'muted', text: q.ex }) : null,
+        q.exp ? h('p', { text: q.exp }) : null,
+        h('div', { class: 'tags' }, h('span', { class: 'tag', text: topicOf(q) }), q.seen ? h('span', { class: 'tag', text: `푼 횟수 ${q.seen}` }) : null, q.miss ? h('span', { class: 'tag', text: `틀림 ${q.miss}` }) : null)),
+      h('p', { class: 'hint', text: q.lib ? 'CLI에서 가져온 문제예요. 고치려면 터미널에서 수정해 주세요.' : '' })
     ]
   });
 }
@@ -610,21 +851,25 @@ const subjectMenu = s => [
   { icon: 'trash', label: '과목 삭제', danger: true, onClick: () => confirmSheet('과목 삭제', `"${s.name}"과 안의 시험·문제가 모두 지워져요.`, '삭제', () => { removeSubject(s); route(true); }) }
 ];
 const examMenu = (s, e) => [
-  { icon: 'plus', label: 'OX 문제 추가', onClick: () => questionSheet(e) },
-  { icon: 'shuffle', label: '문제 섞기', check: db.shuffle !== false, onClick: () => { db.shuffle = db.shuffle === false; save(); toast(db.shuffle ? '문제를 섞어서 풀어요' : '순서대로 풀어요'); } },
   { icon: 'pencil', label: '시험 편집', onClick: () => examSheet(s, e) },
+  { icon: 'retry', label: '처음부터 다시', onClick: () => confirmSheet('처음부터 다시', '이 시험의 점수, 오답, 정복 표시를 모두 지우고 처음부터 시작해요. 문제는 그대로 남아요.', '다시 시작', () => { resetExam(e); route(true); toast('처음부터 시작해요'); }) },
   '-',
   { icon: 'trash', label: '시험 삭제', danger: true, onClick: () => confirmSheet('시험 삭제', `"${e.name}"과 문제 ${e.questions.length}개가 지워져요.`, '삭제', () => { removeExam(s, e); location.hash = '#/s/' + s.id; route(true); }) }
 ];
+function resetExam(e) {
+  e.attempts = [];
+  e.questions.forEach(q => { q.seen = 0; delete q.last; delete q.miss; delete q.done; delete q.at; });
+  save();
+}
 
 /* =====================================================================
    tab screens
    ===================================================================== */
 function examReply(s, e) {
-  const sc = lastScore(e), wr = wrongCount(e);
+  const sc = lastScore(e), wr = wrongCount(e), done = doneCount(e);
   return post({
     sm: true, avatar: av(s.hue, 'doc', 'soft'), title: e.name, href: '#/e/' + e.id, style: palStyle(s.hue),
-    meta: [h('span', { text: `OX ${e.questions.length}문제` }), sc !== null ? h('span', { text: `최근 ${sc}%` }) : null, wr ? st('xcircle', `오답 ${wr}`) : null]
+    meta: [h('span', { text: `${unitOf(e)} ${activeQs(e).length}개` }), done ? h('span', { text: `정복 ${done}` }) : null, sc !== null ? h('span', { text: `최근 ${sc}%` }) : null, wr ? st('xcircle', `오답 ${wr}`) : null]
   });
 }
 
@@ -633,7 +878,7 @@ function subjectThread(s) {
   const rows = [post({
     avatar: av(s.hue, sicon(s)), title: s.name, href: '#/s/' + s.id, style: palStyle(s.hue),
     more: btn => openMenu(btn, subjectMenu(s)), moreLabel: `${s.name} 메뉴`,
-    meta: [h('span', { text: `시험 ${s.exams.length}개 · 문제 ${subjQ(s)}개` }), acc !== null ? st('checkcircle', `정답률 ${acc}%`) : null]
+    meta: [h('span', { text: `시험 ${s.exams.length}개 · 남은 문제 ${subjQ(s)}개` }), acc !== null ? st('checkcircle', `정답률 ${acc}%`) : null]
   })];
   s.exams.slice(0, 2).forEach(e => rows.push(examReply(s, e)));
   if (s.exams.length > 2) rows.push(post({ sm: true, muted: true, avatar: h('span', { class: 'av ghost' }, icon('more')), title: `시험 ${s.exams.length - 2}개 더 보기`, href: '#/s/' + s.id }));
@@ -645,18 +890,17 @@ function viewHome() {
   const subs = db.subjects;
   const body = h('div', { class: 'feed' });
   if (!subs.length) {
-    body.append(emptyState('stack', '첫 과목을 만들어 보세요', '자주 쓰는 과목은 한 번에 추가할 수 있어요.',
+    body.append(emptyState('stack', '첫 과목을 만들어 보세요', '과목을 만들고 시험·단원을 추가한 뒤, 터미널에서 사진을 넘기면 문제가 채워져요.',
       h('div', { class: 'pills' }, PRESETS.map(([n, ic, hue]) => h('button', {
         type: 'button', class: 'btn outline',
         onclick: () => { db.subjects.push({ id: uid(), name: n, icon: ic, hue, exams: [] }); save(); route(true); }
       }, icon(ic), n)))));
   } else subs.forEach(s => body.append(subjectThread(s)));
   const line = subs.length
-    ? [h('span', { text: `과목 ${subs.length}개` }), h('span', { text: `문제 ${subs.reduce((n, s) => n + subjQ(s), 0)}개` })]
+    ? [h('span', { text: `과목 ${subs.length}개` }), h('span', { text: `남은 문제 ${subs.reduce((n, s) => n + subjQ(s), 0)}개` })]
     : [h('span', { text: '공부할 과목을 만들어 보세요' })];
   screen({
     title: '과목', hue: 215, tab: 'home', body, head: pageHead({ title: '과목', lines: [line] }),
-    trail: [{ icon: 'refresh', label: '동기화', cls: 'js-sync', onClick: () => syncLibrary(true) }],
     fab: { icon: 'plus', label: '과목 추가', onClick: () => subjectSheet() }
   });
 }
@@ -676,8 +920,8 @@ function viewWrong() {
       if (!mine.length) continue;
       const rows = [post({ avatar: av(s.hue, sicon(s)), title: s.name, href: '#/s/' + s.id, style: palStyle(s.hue), meta: [h('span', { text: `오답 ${mine.length}개` })] })];
       mine.forEach(({ e, q }) => rows.push(post({
-        sm: true, clamp: true, avatar: oxAv(q), title: q.q, style: palStyle(s.hue), onClick: () => questionSheet(e, q),
-        meta: [h('span', { text: e.name }), q.miss ? h('span', { text: `오답 ${q.miss}회` }) : null]
+        sm: true, clamp: true, avatar: qAvatar(q), title: rowTitle(q), style: palStyle(s.hue), onClick: () => questionSheet(e, q),
+        meta: [h('span', { text: e.name }), h('span', { text: topicOf(q) }), q.miss ? h('span', { text: `틀림 ${q.miss}` }) : null]
       })));
       feed.append(thread(rows));
     }
@@ -700,7 +944,7 @@ function attemptRow({ s, e, a }) {
   return h('a', { class: 'row', href: '#/e/' + e.id },
     ring(pct, false, `${pct}%`),
     h('span', { class: 'row-body' },
-      h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: e.name }), h('span', { class: 'row-sub', text: `${s.name} · ${a.mode === 'wrong' ? '오답만' : '전체'} · ${timeLabel(a.at)}` })),
+      h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: e.name }), h('span', { class: 'row-sub', text: `${s.name} · ${a.mode === 'wrong' ? '오답만' : '연습'} · ${timeLabel(a.at)}${a.retired ? ` · 정복 ${a.retired}` : ''}` })),
       h('span', { class: 'score', text: `${a.score}/${a.total}` }), dim('chev')));
 }
 
@@ -708,11 +952,11 @@ function viewHistory() {
   const all = allAttempts();
   const body = h('div', { class: 'stack' });
   if (!all.length) {
-    body.append(emptyState('clock', '아직 기록이 없어요', '시험을 풀면 점수가 여기에 쌓여요.'));
+    body.append(emptyState('clock', '아직 기록이 없어요', '연습을 하면 점수가 여기에 쌓여요.'));
   } else {
     const avg = Math.round(all.reduce((n, x) => n + (x.a.score / x.a.total) * 100, 0) / all.length);
     body.append(h('div', { class: 'facts' },
-      h('div', null, h('b', { text: String(all.length) }), h('span', { text: '풀이 횟수' })),
+      h('div', null, h('b', { text: String(all.length) }), h('span', { text: '연습 횟수' })),
       h('div', null, h('b', { text: avg + '%' }), h('span', { text: '평균 점수' })),
       h('div', null, h('b', { text: String(allWrong().length) }), h('span', { text: '남은 오답' }))));
     const days = [];
@@ -725,7 +969,7 @@ function viewHistory() {
   }
   screen({
     title: '기록', hue: 180, tab: 'history', body,
-    head: pageHead({ title: '기록', lines: [[h('span', { text: all.length ? `최근 ${all.length}번 풀었어요` : '아직 푼 시험이 없어요' })]] })
+    head: pageHead({ title: '기록', lines: [[h('span', { text: all.length ? `최근 ${all.length}번 연습했어요` : '아직 연습한 기록이 없어요' })]] })
   });
 }
 
@@ -740,19 +984,17 @@ function srow({ ic, title, sub, subCls, trailing, danger, onClick }) {
 }
 
 function viewSettings() {
-  const sw = h('button', {
-    type: 'button', class: 'switch', role: 'switch', 'aria-label': '문제 섞기', 'aria-checked': String(db.shuffle !== false),
-    onclick: ev => { db.shuffle = db.shuffle === false; save(); ev.currentTarget.setAttribute('aria-checked', String(db.shuffle)); }
-  });
+  const size = picker(SIZES.map(n => ({ value: n, label: String(n), aria: `${n}문제` })), db.size, 'seg', v => { db.size = v; save(); });
   const body = h('div', { class: 'stack' },
     h('div', null, h('div', { class: 'sec', text: 'Claude CLI 연결' }), h('div', { class: 'group' },
       srow({
-        ic: 'terminal', title: '자동 동기화', sub: syncText(), subCls: 'js-sync-text',
+        ic: 'terminal', title: '동기화', sub: syncText(), subCls: 'js-sync-text',
         trailing: h('button', { type: 'button', class: 'btn sm outline js-sync', onclick: () => syncLibrary(true) }, icon('refresh'), '지금')
       }),
-      h('div', { class: 'note' }, '터미널에서 ', code('/quiz'), ' 로 사진을 넘기면 문제가 ', code('data/library.json'), ' 에 저장되고 push 돼요. 앱은 열릴 때마다 그 파일을 읽어 자동으로 가져와요. 복사나 붙여넣기는 필요 없어요.'))),
-    h('div', null, h('div', { class: 'sec', text: '학습' }), h('div', { class: 'group' },
-      srow({ ic: 'shuffle', title: '문제 섞기', sub: '풀 때마다 순서를 바꿔요', trailing: sw }))),
+      h('div', { class: 'note' }, '앱을 열 때마다 자동으로 가져와요. 터미널에서 ', code('/quiz'), ' 로 사진을 넘기면 ', code('data/library.json'), ' 에 저장되고 push 돼요. 이 버튼은 바로 확인하고 싶을 때만 써요.'))),
+    h('div', null, h('div', { class: 'sec', text: '연습' }), h('div', { class: 'group' },
+      srow({ ic: 'list', title: '한 번에 푸는 문제', sub: '연습을 시작할 때 고르는 개수예요', trailing: size.el }),
+      h('div', { class: 'note' }, '많이 틀린 유형은 더 자주, 잘 맞히는 유형은 덜 나와요. 같은 문제를 ', code(`${RETIRE_AT}번`), ' 풀고 마지막에 맞히면 정복으로 빠져요. 정복한 문제가 늘면 새 문제를 받을 때라고 알려줘요.'))),
     h('div', null, h('div', { class: 'sec', text: '앱' }), h('div', { class: 'group' },
       srow({ ic: 'share', title: '홈 화면에 추가', sub: standalone() ? '홈 화면 앱으로 실행 중이에요' : 'Safari 공유 버튼, 홈 화면에 추가' }),
       srow({
@@ -761,10 +1003,10 @@ function viewSettings() {
       }))),
     h('div', null, h('div', { class: 'sec', text: '데이터' }), h('div', { class: 'group' },
       srow({
-        ic: 'retry', title: '학습 기록 지우기', sub: '점수와 오답 표시만 지워요', danger: true,
-        onClick: () => confirmSheet('학습 기록 지우기', '푼 기록과 오답 표시가 모두 지워져요. 문제는 그대로 남아요.', '지우기', () => {
-          db.subjects.forEach(s => s.exams.forEach(e => { e.attempts = []; e.questions.forEach(q => { delete q.last; delete q.miss; }); }));
-          save(); route(true); toast('학습 기록을 지웠어요');
+        ic: 'retry', title: '학습 기록 지우기', sub: '점수, 오답, 정복 표시만 지워요', danger: true,
+        onClick: () => confirmSheet('학습 기록 지우기', '푼 기록, 오답, 정복 표시가 모두 지워져요. 문제는 그대로 남아요.', '지우기', () => {
+          db.subjects.forEach(s => s.exams.forEach(resetExam));
+          route(true); toast('학습 기록을 지웠어요');
         })
       }),
       srow({
@@ -786,16 +1028,15 @@ function viewSubject(s) {
   const acc = subjAcc(s);
   const body = h('div', null);
   if (!s.exams.length) {
-    body.append(emptyState('doc', '시험·단원을 만들어요', '예: 중간고사, 기말고사, 3단원. 안에 문제를 모아 시험처럼 풀 수 있어요.'));
+    body.append(emptyState('doc', '시험·단원을 만들어요', '예: 중간고사, 3단원, Day 12. 같은 이름으로 터미널에서 사진을 넘기면 문제가 채워져요.'));
   } else {
     body.append(h('div', { class: 'rows', style: palStyle(s.hue) }, s.exams.map(e => {
-      const sc = lastScore(e), wr = wrongCount(e);
+      const sc = lastScore(e), wr = wrongCount(e), act = activeQs(e).length, dn = doneCount(e);
+      const sub = !e.questions.length ? '사진으로 채워요' : `${unitOf(e)} ${act}개${dn ? ` · 정복 ${dn}` : ''}${sc !== null ? ` · 최근 ${sc}%` : ''}`;
       return h('a', { class: 'row', href: '#/e/' + e.id },
         av(s.hue, 'doc', 'soft'),
         h('span', { class: 'row-body' },
-          h('span', { class: 'row-main' },
-            h('span', { class: 'row-title', text: e.name }),
-            h('span', { class: 'row-sub', text: `OX ${e.questions.length}문제 · ${sc !== null ? `최근 ${sc}%` : '아직 안 풀었어요'}` })),
+          h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: e.name }), h('span', { class: 'row-sub', text: sub })),
           e.lib ? h('span', { class: 'badge plain' }, icon('terminal'), 'CLI') : null,
           wr ? h('span', { class: 'badge' }, icon('xcircle'), String(wr)) : null, dim('chev')));
     })));
@@ -804,7 +1045,7 @@ function viewSubject(s) {
     title: s.name, hue: s.hue, tab: 'home', detail: true, subjectId: s.id, back: '#/', body,
     head: pageHead({
       title: s.name, avatar: av(s.hue, sicon(s)),
-      lines: [[h('span', { text: `시험 ${s.exams.length}개` }), h('span', { text: `문제 ${subjQ(s)}개` }), acc !== null ? st('checkcircle', `정답률 ${acc}%`) : null]]
+      lines: [[h('span', { text: `시험 ${s.exams.length}개` }), h('span', { text: `남은 문제 ${subjQ(s)}개` }), acc !== null ? st('checkcircle', `정답률 ${acc}%`) : null]]
     }),
     trail: [{ icon: 'more', label: '과목 메뉴', onClick: btn => openMenu(btn, subjectMenu(s)) }],
     dock: [h('button', { type: 'button', class: 'pbtn', onclick: () => examSheet(s) }, icon('plus'), '시험·단원 추가')],
@@ -812,38 +1053,78 @@ function viewSubject(s) {
   });
 }
 
-const ui = { examTab: 'q', examFor: null };
-function viewExam({ s, e }) {
-  if (ui.examFor !== e.id) { ui.examFor = e.id; ui.examTab = 'q'; }
-  const n = e.questions.length, wr = wrongCount(e), sc = lastScore(e);
-  const facts = h('div', { class: 'facts' },
-    h('div', null, h('b', { text: String(n) }), h('span', { text: '문제' })),
-    h('div', null, h('b', { text: sc === null ? '-' : sc + '%' }), h('span', { text: '최근 점수' })),
-    h('div', null, h('b', { text: String(wr) }), h('span', { text: '오답' })));
-  const body = h('div', null);
-  body.append(h('div', { class: 'utabs', role: 'tablist' },
-    ['q', 'h'].map(k => h('button', {
-      type: 'button', class: 'utab', role: 'tab', 'aria-selected': String(ui.examTab === k),
-      onclick: () => { if (ui.examTab !== k) { ui.examTab = k; route(true); } }
-    }, k === 'q' ? `문제 ${n}` : `기록 ${e.attempts.length}`))));
-  if (ui.examTab === 'q') {
-    body.append(h('button', { type: 'button', class: 'composer', style: palStyle(s.hue), onclick: () => questionSheet(e) },
-      av(s.hue, 'plus', 'soft'), h('span', { class: 'ph', text: '새 OX 문제 추가…' }), h('span', { class: 'go', text: '추가' })));
-    if (!n) body.append(emptyState('doc', '문제가 아직 없어요', '위에서 직접 추가하거나, 터미널에서 /quiz 로 사진을 넘겨 보세요.'));
-    else body.append(h('div', { class: 'rows', style: palStyle(s.hue) }, e.questions.map(q => h('button', { type: 'button', class: 'row', onclick: () => questionSheet(e, q) },
-      oxAv(q, 36),
+const ui = { examTab: 'q', examFor: null, showDone: false };
+
+function topicRows(s, e) {
+  const ts = topicStats(e.questions), wsum = {};
+  let total = 0;
+  for (const q of activeQs(e)) { const v = weightOf(q, ts), k = topicOf(q); wsum[k] = (wsum[k] || 0) + v; total += v; }
+  const list = Object.entries(ts).map(([k, t]) => ({ k, ...t, err: t.a ? t.w / t.a : null, share: total ? (wsum[k] || 0) / total : 0 }));
+  list.sort((x, y) => (y.err === null ? -1 : y.err) - (x.err === null ? -1 : x.err) || y.n - x.n);
+  return list.map(t => {
+    const weak = t.a >= 3 && t.err >= 0.4;
+    const pct = Math.round(t.share * 100);
+    return h('div', { class: 'row static' },
+      av(s.hue, 'chart', 'soft'),
       h('span', { class: 'row-body' },
-        h('span', { class: 'row-main' }, h('span', { class: 'row-title clamp2', text: q.q }), q.miss ? h('span', { class: 'row-sub', text: `오답 ${q.miss}회` }) : null),
-        q.lib ? dim('terminal') : null, dim('chev'))))));
+        h('span', { class: 'row-main' },
+          h('span', { class: 'row-title', text: t.k }),
+          h('span', { class: 'row-sub', text: `${t.n}개 남음${t.done ? ` · 정복 ${t.done}` : ''}${t.a ? ` · 정답률 ${Math.round((1 - t.err) * 100)}%` : ' · 아직 안 풀었어요'}` }),
+          h('span', { class: 'bar', 'aria-hidden': 'true' }, h('span', { style: `width:${t.n ? Math.max(3, pct) : 0}%` }))),
+        weak ? h('span', { class: 'badge' }, '약해요') : null,
+        h('span', { class: 'score', 'aria-label': `출제 비중 ${pct}%`, text: t.n ? `${pct}%` : '-' })));
+  });
+}
+
+function viewExam({ s, e }) {
+  if (ui.examFor !== e.id) { ui.examFor = e.id; ui.examTab = 'q'; ui.showDone = false; }
+  const total = e.questions.length, act = activeQs(e), dn = total - act.length, wr = wrongCount(e), acc = examAcc(e), unit = unitOf(e);
+  const facts = h('div', { class: 'facts' },
+    h('div', null, h('b', { text: String(act.length) }), h('span', { text: `남은 ${unit}` })),
+    h('div', null, h('b', { text: String(dn) }), h('span', { text: '정복' })),
+    h('div', null, h('b', { text: acc === null ? '-' : acc + '%' }), h('span', { text: '정답률' })));
+  const topicsN = Object.keys(topicStats(e.questions)).length;
+  const tabs = [['q', `${unit} ${act.length}`], ['t', `유형 ${topicsN}`], ['h', `기록 ${e.attempts.length}`]];
+  const body = h('div', null);
+  body.append(h('div', { class: 'utabs', role: 'tablist' }, tabs.map(([k, label]) => h('button', {
+    type: 'button', class: 'utab', role: 'tab', 'aria-selected': String(ui.examTab === k),
+    onclick: () => { if (ui.examTab !== k) { ui.examTab = k; route(true); } }
+  }, label))));
+
+  const cmd = h('div', { class: 'cmd' }, code(`/quiz ${s.name} ${e.name} 사진경로`));
+  if (ui.examTab === 'q') {
+    if (!total) {
+      body.append(emptyState('doc', `${unit}가 아직 없어요`, '문제는 직접 쓰지 않아요. 책 사진을 터미널의 Claude CLI에 넘기면 150개가 만들어져요.', cmd));
+    } else {
+      const need = total >= 20 && act.length <= Math.max(10, Math.round(total * 0.25));
+      if (!act.length) {
+        body.append(emptyState('checkcircle', `전부 정복했어요`, `${total}개를 모두 6번씩 풀었어요. 새 ${unit}를 받으려면 터미널에서 /quiz 리프레시를 하거나, 처음부터 다시 풀 수 있어요.`,
+          h('div', { class: 'pills' }, h('button', { type: 'button', class: 'btn outline', onclick: () => { resetExam(e); route(true); } }, icon('retry'), '처음부터 다시'))));
+      } else if (need) {
+        body.append(h('section', { class: 'callout col' },
+          h('div', null, h('b', { text: `정복 ${dn}/${total}` }), h('span', { text: `남은 ${unit}가 적어요. 새 ${unit}로 바꿀 때예요.` })),
+          h('p', { class: 'muted' }, '터미널에서 ', code('/quiz'), ' 로 같은 사진의 새 문제를 받아 오면 자동으로 이어져요.')));
+      }
+      if (act.length) body.append(h('div', { class: 'rows', style: palStyle(s.hue) }, act.map(q => qRow(e, q))));
+      if (dn) {
+        body.append(h('button', { type: 'button', class: 'btn outline togg', onclick: () => { ui.showDone = !ui.showDone; route(true); } }, icon(ui.showDone ? 'close' : 'check'), ui.showDone ? '정복한 것 숨기기' : `정복한 ${unit} ${dn}개 보기`));
+        if (ui.showDone) body.append(h('div', { class: 'rows done', style: palStyle(s.hue) }, e.questions.filter(q => q.done).map(q => qRow(e, q))));
+      }
+    }
+  } else if (ui.examTab === 't') {
+    if (!total) body.append(emptyState('chart', '유형이 아직 없어요', '문제가 들어오면 유형별로 모아 보여줘요.', cmd));
+    else body.append(h('p', { class: 'note flat' }, '많이 틀린 유형이 더 자주 나와요. 오른쪽 숫자는 다음 연습에서 그 유형이 나올 비중이에요.'), h('div', { class: 'rows' }, topicRows(s, e)));
   } else if (!e.attempts.length) {
-    body.append(emptyState('clock', '아직 푼 기록이 없어요', '시작하기를 눌러 풀어 보세요.'));
+    body.append(emptyState('clock', '아직 연습한 기록이 없어요', '시작하기를 눌러 풀어 보세요.'));
   } else {
     body.append(h('div', { class: 'rows' }, e.attempts.slice().reverse().map(a => attemptRow({ s, e, a }))));
   }
-  const dock = n ? [
+
+  const n = Math.min(db.size, act.length);
+  const dock = act.length ? [
     h('a', wr ? { class: 'glass gbtn', href: `#/p/${e.id}/wrong` } : { class: 'glass gbtn', 'aria-disabled': 'true' }, icon('bookmark'), `오답 ${wr}`),
-    h('a', { class: 'pbtn', href: `#/p/${e.id}/all` }, icon('play'), '시작하기')
-  ] : [h('button', { type: 'button', class: 'pbtn', onclick: () => questionSheet(e) }, icon('plus'), '문제 추가')];
+    h('a', { class: 'pbtn', href: `#/p/${e.id}/all` }, icon('play'), `${n}${unit === '단어' ? '개' : '문제'} 연습`)
+  ] : [];
   screen({
     title: e.name, hue: s.hue, tab: 'home', detail: true, subjectId: s.id, back: '#/s/' + s.id, dock,
     head: [pageHead({
@@ -851,9 +1132,15 @@ function viewExam({ s, e }) {
       lines: [[h('a', { href: '#/s/' + s.id, class: 'st' }, icon(sicon(s)), s.name), e.lib ? st('terminal', 'CLI 연동') : null]]
     }), facts],
     body,
-    trail: [{ icon: 'more', label: '시험 메뉴', onClick: btn => openMenu(btn, examMenu(s, e)) }],
-    fab: { icon: 'plus', label: 'OX 문제 추가', onClick: () => questionSheet(e) }
+    trail: [{ icon: 'more', label: '시험 메뉴', onClick: btn => openMenu(btn, examMenu(s, e)) }]
   });
+}
+function qRow(e, q) {
+  return h('button', { type: 'button', class: 'row' + (q.done ? ' dn' : ''), onclick: () => questionSheet(e, q) },
+    qAvatar(q, 36),
+    h('span', { class: 'row-body' },
+      h('span', { class: 'row-main' }, h('span', { class: 'row-title clamp2', text: rowTitle(q) }), h('span', { class: 'row-sub', text: rowSub(q) })),
+      q.done ? dim('check') : null, dim('chev')));
 }
 
 /* =====================================================================
@@ -862,24 +1149,19 @@ function viewExam({ s, e }) {
 let play = null;
 
 function startPlay(eid, mode) {
-  let qs, title, back, hue = 215, name = '', ic = 'book';
+  let pool, title, back, hue = 215, name = '', ic = 'book';
   if (eid === '_') {
-    qs = allWrong().map(x => x.q); title = '오답 복습'; back = '#/wrong'; hue = 340; name = '오답노트'; ic = 'bookmark';
+    pool = allWrong(); title = '오답 복습'; back = '#/wrong'; hue = 340; name = '오답노트'; ic = 'bookmark';
   } else {
     const f = findExam(eid);
     if (!f) return false;
-    qs = f.e.questions.slice();
-    if (mode === 'wrong') qs = qs.filter(q => q.last === false);
+    pool = activeQs(f.e).map(q => ({ q, e: f.e, s: f.s }));
+    if (mode === 'wrong') pool = pool.filter(x => x.q.last === false);
     title = f.e.name; back = '#/e/' + eid; hue = f.s.hue; name = f.s.name; ic = sicon(f.s);
   }
-  if (!qs.length) { toast('풀 문제가 없어요'); location.replace(eid === '_' ? '#/wrong' : '#/e/' + eid); return false; }
-  if (db.shuffle !== false) {
-    for (let i = qs.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [qs[i], qs[j]] = [qs[j], qs[i]];
-    }
-  }
-  play = { eid, mode, qs, title, back, hue, name, ic, i: 0, res: [], picked: null, done: false };
+  if (!pool.length) { toast('풀 문제가 없어요'); location.replace(eid === '_' ? '#/wrong' : '#/e/' + eid); return false; }
+  const items = pickSession(pool, db.size || 20);
+  play = { eid, mode, items, drills: items.map(makeDrill), i: 0, res: [], answered: false, picked: null, ok: null, done: false, retired: 0, title, back, hue, name, ic };
   return true;
 }
 function restart(mode) {
@@ -889,27 +1171,39 @@ function restart(mode) {
   if (location.hash === t) route(); else location.hash = t;
 }
 function answer(val) {
-  if (!play || play.picked !== null || play.done) return;
-  const q = play.qs[play.i], ok = val === q.a;
-  play.picked = val;
-  play.res.push({ q, ok });
-  q.last = ok;
-  if (!ok) q.miss = (q.miss || 0) + 1;
+  if (!play || play.answered || play.done) return;
+  const it = play.items[play.i], d = play.drills[play.i];
+  const ok = checkDrill(d, val), was = !!it.q.done;
+  play.answered = true; play.picked = val; play.ok = ok;
+  recordAnswer(it.q, ok);
+  if (!was && it.q.done) play.retired++;
+  play.res.push({ it, d, ok, val });
+  save();
+  renderPlay();
+}
+/* a typed answer that was right but written differently: let the learner say so */
+function markCorrect() {
+  if (!play || !play.answered || play.ok) return;
+  const r = play.res[play.res.length - 1], q = r.it.q;
+  q.miss = Math.max(0, (q.miss || 0) - 1);
+  q.last = true;
+  if (seenOf(q) >= RETIRE_AT && !q.done) { q.done = true; play.retired++; }
+  r.ok = true; play.ok = true;
   save();
   renderPlay();
 }
 function next() {
-  if (play.i + 1 >= play.qs.length) {
+  if (play.i + 1 >= play.items.length) {
     if (play.eid !== '_') {
       const f = findExam(play.eid);
-      f.e.attempts.push({ at: Date.now(), mode: play.mode, score: play.res.filter(r => r.ok).length, total: play.qs.length });
+      f.e.attempts.push({ at: Date.now(), mode: play.mode, score: play.res.filter(r => r.ok).length, total: play.items.length, retired: play.retired });
       f.e.attempts = f.e.attempts.slice(-30);
       save();
     }
     play.done = true;
   } else {
     play.i++;
-    play.picked = null;
+    play.answered = false; play.picked = null; play.ok = null;
   }
   renderPlay();
   window.scrollTo(0, 0);
@@ -921,43 +1215,87 @@ const oxBtn = val => h('button', { type: 'button', class: 'glass oxbtn', 'aria-l
 function renderPlay() {
   const p = play;
   if (p.done) return renderResult();
-  const q = p.qs[p.i], total = p.qs.length, answered = p.picked !== null, ok = answered && p.picked === q.a;
+  const it = p.items[p.i], d = p.drills[p.i], q = it.q, total = p.items.length, answered = p.answered, ok = p.ok;
   const done = p.i + (answered ? 1 : 0);
+  const where = p.eid === '_' ? `${it.s.name} · ${it.e.name}` : p.name;
+
+  /* what the learner interacts with, inside the question post */
+  let control = null, input = null;
+  if (d.kind === 'mc') {
+    control = h('div', { class: 'choices', role: 'group', 'aria-label': '보기' }, d.choices.map((c, i) => {
+      const state = answered ? (i === d.correct ? ' ok' : i === p.picked ? ' no' : ' off') : '';
+      return h('button', { type: 'button', class: 'choice' + state, 'aria-disabled': String(answered), onclick: () => answer(i) },
+        h('span', { class: 'cn', text: String(i + 1) }), h('span', { class: 'ct', text: c }),
+        answered && i === d.correct ? icon('check') : answered && i === p.picked ? icon('close') : null);
+    }));
+  } else if (d.kind === 'short') {
+    input = h('input', {
+      class: 'ans-input', type: 'text', 'aria-label': '정답 입력', placeholder: '정답을 입력해요', value: answered ? String(p.picked || '') : '',
+      disabled: answered ? true : null, autocomplete: 'off', autocorrect: 'off', autocapitalize: 'none', spellcheck: 'false', enterkeyhint: 'done'
+    });
+    control = h('div', { class: 'ans-wrap' + (answered ? (ok ? ' ok' : ' no') : '') }, input);
+  }
+
   const rows = [h('div', { class: 'post' + (answered ? ' next' : ''), style: palStyle(p.hue) },
     h('div', { class: 'post-av' }, av(p.hue, p.ic)),
     h('div', { class: 'post-body' },
-      h('div', { class: 'qhead' }, h('span', { text: p.name }), h('span', { class: 'tag', text: 'OX' })),
-      h('p', { class: 'q-text', text: q.q })))];
+      h('div', { class: 'qhead' }, h('span', { text: where }), h('span', { class: 'tag', text: d.label }), h('span', { class: 'tag soft', text: topicOf(q) })),
+      h('p', { class: 'q-text' + (d.big ? ' term' : ''), text: d.prompt }),
+      d.sub ? h('p', { class: 'q-sub', text: d.sub }) : null,
+      d.extra ? h('p', { class: 'q-sub ex', text: d.extra }) : null,
+      control))];
+
   if (answered) {
+    const lines = [];
+    if (d.kind === 'ox') lines.push(h('div', { class: 'tags' }, h('span', { class: 'tag', text: `내 답 ${p.picked ? 'O' : 'X'}` }), h('span', { class: 'tag', text: `정답 ${d.correct ? 'O' : 'X'}` })));
+    else if (!ok) lines.push(h('p', { class: 'ansline' }, h('b', { text: '정답' }), h('span', { text: drillAnswer(d) })));
+    if (d.kind === 'short' && !ok) lines.unshift(h('p', { class: 'ansline' }, h('b', { text: '내 답' }), h('span', { text: String(p.picked || '(비움)') })));
+    if (q.type === 'word') lines.push(h('p', { class: 'ansline' }, h('b', { text: '뜻' }), h('span', { text: `${q.term} = ${q.meaning}` })));
+    if (q.type === 'word' && q.ex) lines.push(h('p', { class: 'muted' }, q.ex));
+    if (q.exp) lines.push(h('p', { text: q.exp }));
+    const wasRetired = q.done && seenOf(q) >= RETIRE_AT;
     rows.push(h('div', { class: 'post sm reply prev ' + (ok ? 'ok' : 'no'), style: palStyle(p.hue), 'aria-live': 'polite' },
       h('div', { class: 'post-av' }, h('span', { class: 'av ' + (ok ? 'good' : 'bad') }, icon(ok ? 'check' : 'close'))),
       h('div', { class: 'post-body' },
-        h('div', { class: 'post-head' }, h('span', { class: 'post-title', text: ok ? '정답이에요' : '오답이에요' })),
-        h('div', { class: 'tags' }, h('span', { class: 'tag', text: `내 답 ${p.picked ? 'O' : 'X'}` }), h('span', { class: 'tag', text: `정답 ${q.a ? 'O' : 'X'}` })),
-        q.exp ? h('p', { text: q.exp }) : null)));
+        h('div', { class: 'post-head' }, h('span', { class: 'post-title', text: ok ? (wasRetired ? '정답이에요 · 정복!' : '정답이에요') : '오답이에요' })),
+        ...lines,
+        !ok && d.kind === 'short' ? h('button', { type: 'button', class: 'btn sm outline fix', onclick: markCorrect }, icon('check'), '맞게 처리') : null)));
   }
+
   const body = h('div', null,
     h('div', { class: 'progress', role: 'progressbar', 'aria-label': '진행도', 'aria-valuemin': 0, 'aria-valuemax': total, 'aria-valuenow': done }, h('span', { style: `width:${(done / total) * 100}%` })),
     h('section', { class: 'qpost' }, rows));
-  screen({
-    title: p.title, inline: `${p.i + 1} / ${total}`, close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body,
-    dock: answered
-      ? [h('button', { id: 'next', type: 'button', class: 'pbtn', onclick: next }, p.i + 1 >= total ? '결과 보기' : '다음 문제', icon('chev'))]
-      : [oxBtn(true), oxBtn(false)]
-  });
+
+  let dock;
+  if (answered) dock = [h('button', { id: 'next', type: 'button', class: 'pbtn', onclick: next }, p.i + 1 >= total ? '결과 보기' : '다음', icon('chev'))];
+  else if (d.kind === 'ox') dock = [oxBtn(true), oxBtn(false)];
+  else if (d.kind === 'short') {
+    const go = h('button', { type: 'button', class: 'pbtn', 'aria-disabled': 'true', onclick: () => submit() }, '확인');
+    const submit = () => { const v = input.value.trim(); if (v) answer(v); };
+    input.addEventListener('input', () => go.setAttribute('aria-disabled', String(!input.value.trim())));
+    input.addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); submit(); } });
+    dock = [h('button', { type: 'button', class: 'glass gbtn narrow', onclick: () => answer('') }, '모르겠어요'), go];
+  } else dock = [];
+
+  screen({ title: p.title, inline: `${p.i + 1} / ${total}`, close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body, dock });
   if (answered) requestAnimationFrame(() => { const n = document.getElementById('next'); if (n) n.focus({ preventScroll: true }); });
+  else if (input) input.focus({ preventScroll: true });   // synchronous, so it is still inside the tap that opened it
 }
 
 function renderResult() {
   const p = play;
-  const total = p.qs.length, score = p.res.filter(r => r.ok).length;
+  const total = p.items.length, score = p.res.filter(r => r.ok).length;
   const pct = Math.round((score / total) * 100), wrong = p.res.filter(r => !r.ok);
   const msg = pct >= 90 ? '훌륭해요' : pct >= 70 ? '좋아요, 조금만 더' : '한 번 더 복습해 봐요';
   const body = h('div', null,
-    h('section', { class: 'scorebox' }, ring(pct, true, `${pct}%`), h('p', { class: 'big', text: `${score} / ${total} 정답` }), h('p', { class: 'sub', text: msg })),
+    h('section', { class: 'scorebox' }, ring(pct, true, `${pct}%`), h('p', { class: 'big', text: `${score} / ${total} 정답` }),
+      h('p', { class: 'sub' }, msg), p.retired ? h('p', { class: 'sub' }, st('check', `정복한 문제 ${p.retired}개`)) : null),
     wrong.length ? h('div', { class: 'sec', text: `틀린 문제 ${wrong.length}개` }) : null,
-    wrong.length ? h('div', { class: 'rows' }, wrong.map(({ q }) => h('div', { class: 'row' }, oxAv(q, 36),
-      h('span', { class: 'row-body' }, h('span', { class: 'row-main' }, h('span', { class: 'row-title', text: q.q }), q.exp ? h('span', { class: 'row-sub', text: q.exp }) : null))))) : null);
+    wrong.length ? h('div', { class: 'rows' }, wrong.map(({ it, d }) => h('div', { class: 'row' }, qAvatar(it.q, 36),
+      h('span', { class: 'row-body' }, h('span', { class: 'row-main' },
+        h('span', { class: 'row-title', text: d.prompt }),
+        h('span', { class: 'row-sub', text: `정답  ${drillAnswer(d)}` }),
+        it.q.exp ? h('span', { class: 'row-sub', text: it.q.exp }) : null))))) : null);
   screen({
     title: '결과', inline: '결과', close: p.back, plain: true, detail: true, hue: p.hue, tab: 'home', body,
     dock: wrong.length
@@ -968,9 +1306,10 @@ function renderResult() {
 
 document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape') closeMenu();
-  if (!play || play.done || $sheet.open || ev.ctrlKey || ev.metaKey || ev.altKey) return;
-  if (ev.code === 'KeyO') answer(true);
-  else if (ev.code === 'KeyX') answer(false);
+  if (!play || play.done || $sheet.open || ev.ctrlKey || ev.metaKey || ev.altKey || isTyping()) return;
+  const d = play.drills[play.i];
+  if (d.kind === 'ox') { if (ev.code === 'KeyO') answer(true); else if (ev.code === 'KeyX') answer(false); }
+  else if (d.kind === 'mc' && /^[1-5]$/.test(ev.key) && +ev.key <= d.choices.length) answer(+ev.key - 1);
 });
 
 /* =====================================================================
@@ -1016,6 +1355,7 @@ window.addEventListener('hashchange', () => route());
    start
    ===================================================================== */
 buildNav();
+syncViewport();
 route();
 syncLibrary();
 checkUpdate();
